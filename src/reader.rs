@@ -4901,10 +4901,10 @@ fn get_autosuggestion_performer(
                 match copilot_autocomplete(
                     &prompt,
                     &github_token,
-                    Some(50),  // max_tokens - slightly increased
-                    Some(0.2), // temperature - slightly higher for more creativity
+                    Some(128),  // max_tokens - slightly increased
+                    Some(0.), // temperature - slightly higher for more creativity
                     Some(vec!["\n".to_string()]), // stop at newlines
-                    Some("shell"), // language
+                    Some("fish"), // language
                     None, // no suffix
                     false, // is_copilot_token
                 ) {

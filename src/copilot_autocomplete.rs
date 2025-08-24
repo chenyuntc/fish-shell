@@ -1,70 +1,75 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::env;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Deserialize)]
-struct TokenResponse {
-    token: String,
-    expires_at: f64,
+struct CodestralMessage {
+    role: String,
+    content: String,
+    tool_calls: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
-struct CompletionChoice {
-    text: Option<String>,
+struct CodestralChoice {
+    index: i32,
+    finish_reason: String,
+    message: CodestralMessage,
 }
 
 #[derive(Debug, Deserialize)]
-struct CompletionResponse {
-    choices: Option<Vec<CompletionChoice>>,
+struct CodestralUsage {
+    prompt_tokens: i32,
+    total_tokens: i32,
+    completion_tokens: i32,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodestralResponse {
+    id: String,
+    created: i64,
+    model: String,
+    usage: CodestralUsage,
+    object: String,
+    choices: Vec<CodestralChoice>,
 }
 
 #[derive(Debug, Serialize)]
-struct CompletionExtra {
-    language: String,
-    next_indent: i32,
-    trim_by_indentation: bool,
-}
-
-#[derive(Debug, Serialize)]
-struct CompletionRequest {
+struct CodestralRequest {
+    model: String,
     prompt: String,
-    suffix: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    suffix: Option<String>,
+    stop: Vec<String>,
     max_tokens: i32,
     temperature: f64,
-    top_p: f64,
-    n: i32,
-    stop: Vec<String>,
-    stream: bool,
-    extra: CompletionExtra,
 }
 
-/// Exchange GitHub token for Copilot token
-fn get_copilot_token(github_token: &str) -> Result<(String, f64), Box<dyn std::error::Error>> {
-    let auth_header = if github_token.starts_with("ghu_") {
-        format!("Bearer {}", github_token)
-    } else {
-        format!("token {}", github_token)
+/// Make the actual API request to Codestral and return completion text
+fn make_codestral_request(
+    api_key: &str,
+    prompt: &str,
+    suffix: Option<&str>,
+    max_tokens: i32,
+    stops: Vec<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let payload = CodestralRequest {
+        model: "codestral-latest".to_string(),
+        prompt: prompt.to_string(),
+        suffix: suffix.and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) }),
+        stop: stops,
+        max_tokens,
+        temperature: 0.0,
     };
 
-    let client = reqwest::blocking::Client::new();
-    let mut headers = HashMap::new();
-    headers.insert("content-type", "application/json");
-    headers.insert("accept", "application/json");
-    headers.insert("User-Agent", "GitHubCopilotChat/0.12.2024062801");
-    headers.insert("Editor-Version", "vscode/1.93.1");
-    headers.insert("Editor-Plugin-Version", "copilot-chat/0.12.2024062801");
-    headers.insert("VScode-SessionId", "12345678-1234-1234-1234-123456789012");
-
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(5000))  // 5s timeout for autosuggestions
+        .build()?;
+    
     let response = client
-        .get("https://api.github.com/copilot_internal/v2/token")
-        .header("Authorization", auth_header)
-        .header("content-type", "application/json")
-        .header("accept", "application/json")
-        .header("User-Agent", "GitHubCopilotChat/0.12.2024062801")
-        .header("Editor-Version", "vscode/1.93.1")
-        .header("Editor-Plugin-Version", "copilot-chat/0.12.2024062801")
-        .header("VScode-SessionId", "12345678-1234-1234-1234-123456789012")
+        .post("https://codestral.mistral.ai/v1/fim/completions")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&payload)
         .send()?;
 
     if !response.status().is_success() {
@@ -73,295 +78,167 @@ fn get_copilot_token(github_token: &str) -> Result<(String, f64), Box<dyn std::e
         return Err(format!("HTTP error: {}", error_text).into());
     }
 
-    let result: TokenResponse = response.json()?;
-    Ok((result.token, result.expires_at))
-}
-
-/// Calculate temperature based on prompt line count
-fn calculate_temperature(prompt: &str) -> f64 {
-    let line_count = prompt.lines().count().max(1) - 2;
-    let line_count = line_count.max(1);
-
-    if line_count <= 1 {
-        0.0
-    } else if line_count <= 10 {
-        0.2
-    } else if line_count < 20 {
-        0.4
-    } else {
-        0.8
-    }
-}
-
-/// Make the actual API request to Copilot and return completion text
-fn make_copilot_request(
-    copilot_token: &str,
-    prompt: &str,
-    suffix: &str,
-    max_tokens: i32,
-    temperature: f64,
-    stops: Vec<String>,
-    language: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let payload = CompletionRequest {
-        prompt: prompt.to_string(),
-        suffix: suffix.to_string(),
-        max_tokens,
-        temperature,
-        top_p: 1.0,
-        n: 1,
-        stop: stops,
-        stream: true,
-        extra: CompletionExtra {
-            language: language.to_string(),
-            next_indent: 0,
-            trim_by_indentation: true,
-        },
-    };
-
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_millis(5000))  // 5s timeout for autosuggestions
-        .build()?;
+    // Parse the response
+    let codestral_response: CodestralResponse = response.json()?;
     
-    let response = client
-        .post("https://copilot-proxy.githubusercontent.com/v1/engines/copilot-codex/completions")
-        .header("OpenAI-Intent", "copilot-ghost")
-        .header("OpenAI-Organization", "github-copilot")
-        .header("Authorization", format!("Bearer {}", copilot_token))
-        .header("Content-Type", "application/json")
-        .json(&payload)
-        .send()?;
-
-    if !response.status().is_success() {
-        return Err(format!("HTTP error: {}", response.status()).into());
+    // Extract completion text from the first choice
+    if !codestral_response.choices.is_empty() {
+        Ok(codestral_response.choices[0].message.content.clone())
+    } else {
+        Ok(String::new())
     }
-
-    // Parse streaming response
-    let mut completion_text = String::new();
-
-    // Read the entire response text at once
-    let response_text = response.text()?;
-
-    // Process each line in the response
-    for line in response_text.lines() {
-        if line.starts_with("data: ") {
-            let data_str = &line[6..];
-            if data_str == "[DONE]" {
-                break;
-            }
-            if let Ok(data) = serde_json::from_str::<CompletionResponse>(data_str) {
-                if let Some(choices) = data.choices {
-                    if !choices.is_empty() {
-                        if let Some(text) = &choices[0].text {
-                            completion_text.push_str(text);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(completion_text)
 }
 
-/// Get code completion from GitHub Copilot
+/// Get code completion from Mistral Codestral
 ///
 /// # Arguments
 /// * `prompt` - The code context/prompt to complete
-/// * `github_token` - GitHub personal access token OR Copilot token
-/// * `max_tokens` - Maximum tokens to generate (default: 200)
-/// * `temperature` - Sampling temperature 0-1 (default: auto based on line count)
+/// * `api_key` - Codestral API key (or None to use CODESTRAL_API_KEY env var)
+/// * `max_tokens` - Maximum tokens to generate (default: 128)
 /// * `stops` - List of stop sequences (default: ["\n\n"])
-/// * `language` - Programming language (default: "python")
 /// * `suffix` - Code that comes after the cursor (default: "")
-/// * `is_copilot_token` - If true, treat token as Copilot token (skip exchange)
-pub fn copilot_autocomplete(
+pub fn codestral_autocomplete(
     prompt: &str,
-    github_token: &str,
+    api_key: Option<&str>,
     max_tokens: Option<i32>,
-    temperature: Option<f64>,
     stops: Option<Vec<String>>,
-    language: Option<&str>,
     suffix: Option<&str>,
-    is_copilot_token: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    // Get Copilot token
-    let copilot_token = if is_copilot_token || github_token.starts_with("gho_") {
-        github_token.to_string()
+    // Get API key from parameter or environment
+    let api_key = if let Some(key) = api_key {
+        key.to_string()
     } else {
-        let (token, _) = get_copilot_token(github_token)?;
-        token
+        env::var("CODESTRAL_API_KEY").map_err(|_| {
+            "CODESTRAL_API_KEY environment variable not set and no API key provided"
+        })?
     };
 
     // Set defaults
-    let temperature = temperature.unwrap_or_else(|| calculate_temperature(prompt));
     let stops = stops.unwrap_or_else(|| vec!["\n\n".to_string()]);
-    let max_tokens = max_tokens.unwrap_or(200);
-    let language = language.unwrap_or("python");
-    let suffix = suffix.unwrap_or("");
+    let max_tokens = max_tokens.unwrap_or(128);
 
-    make_copilot_request(
-        &copilot_token,
+    make_codestral_request(
+        &api_key,
         prompt,
         suffix,
         max_tokens,
-        temperature,
         stops,
-        language,
     )
 }
 
-/// A client that caches the Copilot token to avoid repeated token exchanges
-pub struct CopilotClient {
-    github_token: String,
-    is_copilot_token: bool,
-    copilot_token: Option<String>,
-    token_expiry: f64,
+/// A client that caches the Codestral API key
+pub struct CodestralClient {
+    api_key: String,
 }
 
-impl CopilotClient {
-    /// Create a new CopilotClient
-    pub fn new(github_token: String, is_copilot_token: Option<bool>) -> Self {
-        let is_copilot_token = is_copilot_token.unwrap_or_else(|| github_token.starts_with("gho_"));
-        let (copilot_token, token_expiry) = if is_copilot_token {
-            (Some(github_token.clone()), f64::INFINITY)
+impl CodestralClient {
+    /// Create a new CodestralClient
+    /// 
+    /// # Arguments
+    /// * `api_key` - Optional API key. If None, will use CODESTRAL_API_KEY env var
+    pub fn new(api_key: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let api_key = if let Some(key) = api_key {
+            key
         } else {
-            (None, 0.0)
+            env::var("CODESTRAL_API_KEY").map_err(|_| {
+                "CODESTRAL_API_KEY environment variable not set and no API key provided"
+            })?
         };
 
-        CopilotClient {
-            github_token,
-            is_copilot_token,
-            copilot_token,
-            token_expiry,
-        }
+        Ok(CodestralClient { api_key })
     }
 
-    /// Get Copilot token, refreshing if expired
-    fn get_copilot_token(&mut self) -> Result<String, Box<dyn std::error::Error>> {
-        if self.is_copilot_token {
-            return Ok(self.github_token.clone());
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as f64;
-
-        if self.copilot_token.is_none() || now >= self.token_expiry {
-            let (token, expiry) = get_copilot_token(&self.github_token)?;
-            self.copilot_token = Some(token.clone());
-            self.token_expiry = expiry;
-            Ok(token)
-        } else {
-            Ok(self.copilot_token.as_ref().unwrap().clone())
-        }
-    }
-
-    /// Get code completion from GitHub Copilot with cached token
+    /// Get code completion from Codestral
     pub fn autocomplete(
-        &mut self,
+        &self,
         prompt: &str,
         max_tokens: Option<i32>,
-        temperature: Option<f64>,
         stops: Option<Vec<String>>,
-        language: Option<&str>,
         suffix: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error>> {
-        let copilot_token = self.get_copilot_token()?;
-
         // Use defaults
-        let temperature = temperature.unwrap_or_else(|| calculate_temperature(prompt));
         let stops = stops.unwrap_or_else(|| vec!["\n\n".to_string()]);
-        let max_tokens = max_tokens.unwrap_or(200);
-        let language = language.unwrap_or("python");
-        let suffix = suffix.unwrap_or("");
+        let max_tokens = max_tokens.unwrap_or(128);
 
-        make_copilot_request(
-            &copilot_token,
+        make_codestral_request(
+            &self.api_key,
             prompt,
             suffix,
             max_tokens,
-            temperature,
             stops,
-            language,
         )
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_calculate_temperature() {
-        assert_eq!(calculate_temperature("single line"), 0.0);
-        assert_eq!(calculate_temperature("line1\nline2\nline3"), 0.0);
-        assert_eq!(calculate_temperature("line1\nline2\nline3\nline4\nline5"), 0.2);
-
-        let many_lines = (0..15).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
-        assert_eq!(calculate_temperature(&many_lines), 0.4);
-
-        let very_many_lines = (0..25).map(|i| format!("line{}", i)).collect::<Vec<_>>().join("\n");
-        assert_eq!(calculate_temperature(&very_many_lines), 0.8);
-    }
-
-    #[test]
-    fn test_copilot_client_creation() {
-        let client = CopilotClient::new("ghu_test123".to_string(), None);
-        assert!(!client.is_copilot_token);
-
-        let client = CopilotClient::new("gho_test123".to_string(), None);
-        assert!(client.is_copilot_token);
-
-        let client = CopilotClient::new("test123".to_string(), Some(true));
-        assert!(client.is_copilot_token);
-    }
+// For backward compatibility, keep the old function name as an alias
+pub fn copilot_autocomplete(
+    prompt: &str,
+    _github_token: &str,  // Ignored, will use CODESTRAL_API_KEY
+    max_tokens: Option<i32>,
+    _temperature: Option<f64>,  // Ignored, always 0
+    stops: Option<Vec<String>>,
+    _language: Option<&str>,  // Ignored
+    suffix: Option<&str>,
+    _is_copilot_token: bool,  // Ignored
+) -> Result<String, Box<dyn std::error::Error>> {
+    codestral_autocomplete(prompt, None, max_tokens, stops, suffix)
 }
+
+// For backward compatibility, keep CopilotClient as an alias
+pub type CopilotClient = CodestralClient;
 
 // Main function for testing
 fn main() {
-    // Get token from environment
-    let github_token = env::var("GITHUB_TOKEN")
-        .or_else(|_| env::var("GITHUB_COPILOT_ACCESS_TOKEN"))
-        .unwrap_or_else(|_| {
-            eprintln!("Error: Set GITHUB_TOKEN or GITHUB_COPILOT_ACCESS_TOKEN environment variable");
-            std::process::exit(1);
-        });
+    // Get API key from environment
+    let api_key = env::var("CODESTRAL_API_KEY").unwrap_or_else(|_| {
+        eprintln!("Error: Set CODESTRAL_API_KEY environment variable");
+        std::process::exit(1);
+    });
 
-    // Simple example
-    let prompt = "def fibonacci(n):\n    \"\"\"Calculate nth Fibonacci number\"\"\"";
+    // Simple example - ffmpeg command completion
+    let prompt = ">  # ffmpeg concat all images (#.png) in current folder into mp4";
 
-    match copilot_autocomplete(
+    println!("Testing Codestral completion with prompt:");
+    println!("{}", prompt);
+    println!();
+
+    match codestral_autocomplete(
         prompt,
-        &github_token,
+        Some(&api_key),
+        Some(128),
+        Some(vec!["\n\n".to_string()]),
         None,
-        None,
-        None,
-        None,
-        None,
-        false,
     ) {
-        Ok(completion) => println!("Completion: {}", completion),
+        Ok(completion) => {
+            println!("Completion:");
+            println!("{}", completion);
+        }
         Err(e) => eprintln!("Error: {}", e),
     }
 
-    // Example with CopilotClient for multiple requests
-    println!("\n--- Testing CopilotClient ---");
-    let mut client = CopilotClient::new(github_token, None);
+    // Example with CodestralClient for multiple requests
+    println!("\n--- Testing CodestralClient ---");
+    
+    match CodestralClient::new(Some(api_key)) {
+        Ok(client) => {
+            let prompts = vec![
+                "def fibonacci(n):\n    \"\"\"Calculate nth Fibonacci number\"\"\"",
+                "fn bubble_sort(arr: &mut [i32]) {\n    // Sort array in place",
+                "class Calculator:\n    def __init__(self):",
+            ];
 
-    let prompts = vec![
-        "def factorial(n):\n    \"\"\"Calculate factorial of n\"\"\"",
-        "fn bubble_sort(arr: &mut [i32]) {\n    // Sort array in place",
-        "class Calculator:\n    def __init__(self):",
-    ];
-
-    for (i, prompt) in prompts.iter().enumerate() {
-        println!("\nPrompt {}:", i + 1);
-        println!("{}", prompt);
-        match client.autocomplete(prompt, None, None, None, None, None) {
-            Ok(completion) => println!("Completion: {}", completion),
-            Err(e) => eprintln!("Error: {}", e),
+            for (i, prompt) in prompts.iter().enumerate() {
+                println!("\nPrompt {}:", i + 1);
+                println!("{}", prompt);
+                match client.autocomplete(prompt, None, None, None) {
+                    Ok(completion) => {
+                        println!("Completion:");
+                        println!("{}", completion);
+                    }
+                    Err(e) => eprintln!("Error: {}", e),
+                }
+            }
         }
+        Err(e) => eprintln!("Error creating client: {}", e),
     }
 }
