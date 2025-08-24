@@ -38,6 +38,7 @@ pub mod autoload;
 pub mod builtins;
 pub mod color;
 pub mod complete;
+pub mod copilot_autocomplete;
 pub mod editable_line;
 pub mod env;
 pub mod env_dispatch;

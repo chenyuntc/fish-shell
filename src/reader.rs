@@ -52,6 +52,7 @@ use errno::{errno, Errno};
 
 use crate::abbrs::abbrs_match;
 use crate::ast::{self, is_same_node, Kind};
+use crate::copilot_autocomplete::copilot_autocomplete;
 use crate::builtins::shared::ErrorCode;
 use crate::builtins::shared::STATUS_CMD_ERROR;
 use crate::builtins::shared::STATUS_CMD_OK;
@@ -2304,7 +2305,7 @@ impl<'a> Reader<'a> {
             self.clear_pager();
         }
 
-        if EXIT_STATE.load(Ordering::Relaxed) != ExitState::FinishedHandlers as _ {
+        if EXIT_STATE.load(Ordering::Relaxed) != ExitState::FinishedHandlers as u8 {
             // The order of the two conditions below is important. Try to restore the mode
             // in all cases, but only complain if interactive.
             if restore_modes
@@ -4798,7 +4799,7 @@ fn get_autosuggestion_performer(
         };
         if cursor_line_has_process_start {
             let mut searcher = HistorySearch::new_with_type(
-                history,
+                history.clone(),
                 search_string.to_owned(),
                 SearchType::LinePrefix,
             );
@@ -4855,7 +4856,89 @@ fn get_autosuggestion_performer(
             complete(&command_line[..would_be_cursor], complete_flags, &ctx);
 
         let suggestion = if completions.is_empty() {
-            WString::new()
+            // No completions found, try LLM as a fallback
+            // Get last 15 commands for context
+            let history_size = history.size();
+            let mut recent_commands = Vec::new();
+
+            if history_size > 0 {
+                let num_items = std::cmp::min(10, history_size);
+                for i in (0..num_items).rev() {
+                    if let Some(item) = history.item_at_index(i + 1) {
+                        let first_line: WString = item
+                            .str()
+                            .as_char_slice()
+                            .split(|&c| c == '\n')
+                            .next()
+                            .unwrap_or(&[])
+                            .into();
+                        recent_commands.push(first_line);
+                    }
+                }
+            }
+
+            // Try to get LLM suggestion
+            // Try both methods to get GITHUB_TOKEN
+            let github_token_opt = vars.get(L!("GITHUB_TOKEN"))
+                .map(|v| v.as_string().to_string())
+                .or_else(|| std::env::var("GITHUB_TOKEN").ok());
+
+            if let Some(github_token) = github_token_opt {
+
+                // Build prompt with recent commands as context
+                let mut prompt = String::new();
+                if !recent_commands.is_empty() {
+                    prompt.push_str("# Fish Shell Command History:\n```fish\n");
+                    for cmd in &recent_commands {
+                        prompt.push_str(&cmd.to_string());
+                        prompt.push('\n');
+                    }
+                }
+                // prompt.push_str("# Complete this shell command:\n");
+                prompt.push_str(&search_string.to_string());
+
+                // Call LLM with built-in timeout
+                match copilot_autocomplete(
+                    &prompt,
+                    &github_token,
+                    Some(50),  // max_tokens - slightly increased
+                    Some(0.2), // temperature - slightly higher for more creativity
+                    Some(vec!["\n".to_string()]), // stop at newlines
+                    Some("shell"), // language
+                    None, // no suffix
+                    false, // is_copilot_token
+                ) {
+                    Ok(llm_completion) => {
+                        // Clean and use the LLM response
+                        let cleaned = llm_completion.trim();
+
+                        if !cleaned.is_empty() {
+                            // Build the full suggestion: user input + LLM completion
+                            let mut full_suggestion = WString::new();
+                            full_suggestion.push_utfstr(search_string);
+
+                            // Check if LLM response already includes what user typed
+                            if cleaned.starts_with(&search_string.to_string()) {
+                                // LLM included the prompt, use as-is
+                                full_suggestion = WString::from(cleaned);
+                            } else {
+                                // LLM gave just the completion, append it
+                                full_suggestion.push_str(cleaned);
+                            }
+
+                            full_suggestion
+                        } else {
+                            WString::new()
+                        }
+                    }
+                    Err(_) => {
+                        // LLM failed, return empty
+                        WString::new()
+                    }
+                }
+            } else {
+                WString::new()
+            }
         } else {
             sort_and_prioritize(&mut completions, complete_flags);
             let comp = &completions[0];

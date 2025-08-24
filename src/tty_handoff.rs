@@ -63,8 +63,8 @@ static KITTY_KEYBOARD_SUPPORTED: AtomicU8 = AtomicU8::new(Capability::Unknown as
 pub fn get_kitty_keyboard_capability() -> Capability {
     let cap = KITTY_KEYBOARD_SUPPORTED.load(Ordering::Relaxed);
     match cap {
-        x if x == Capability::Supported as _ => Capability::Supported,
-        x if x == Capability::NotSupported as _ => Capability::NotSupported,
+        x if x == Capability::Supported as u8 => Capability::Supported,
+        x if x == Capability::NotSupported as u8 => Capability::NotSupported,
         _ => Capability::Unknown,
     }
 }
@@ -152,8 +152,8 @@ impl TtyMetadata {
         }
         let cap = KITTY_KEYBOARD_SUPPORTED.load(Ordering::Relaxed);
         match cap {
-            x if x == Capability::Supported as _ => ProtocolKind::CSI_U,
-            x if x == Capability::NotSupported as _ => ProtocolKind::Other,
+            x if x == Capability::Supported as u8 => ProtocolKind::CSI_U,
+            x if x == Capability::NotSupported as u8 => ProtocolKind::Other,
             _ => ProtocolKind::None,
         }
     }
