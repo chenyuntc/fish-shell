@@ -4896,6 +4896,16 @@ fn get_autosuggestion_performer(
                 }
                 // prompt.push_str("# Complete this shell command:\n");
                 prompt.push_str(&search_string.to_string());
+                // if search_string doesnt end with space, skip (no need to get AI suggestion)
+                if !search_string.ends_with(' ') {
+                    return AutosuggestionResult::new(
+                        command_line,
+                        search_string_range,
+                        WString::new(),
+                        true, // normal completions are case-insensitive
+                        /*is_whole_item_from_history=*/ false,
+                    );
+                }
 
                 // Call LLM with built-in timeout
                 match copilot_autocomplete(
