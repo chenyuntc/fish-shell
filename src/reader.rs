@@ -3487,6 +3487,9 @@ impl<'a> Reader<'a> {
                 }
                 self.input_data.function_set_status(success);
             }
+            rl::LlmSuggest => {
+                self.force_llm_autosuggestion();
+            }
             rl::TransposeChars => {
                 let (elt, el) = self.active_edit_line();
                 if el.len() < 2 {
@@ -4769,6 +4772,7 @@ fn get_autosuggestion_performer(
     command_line: WString,
     cursor_pos: usize,
     history: Arc<History>,
+    llm_mode: bool,
 ) -> impl FnOnce() -> AutosuggestionResult {
     let generation_count = read_generation_count();
     let vars = parser.vars().snapshot();
@@ -4788,83 +4792,76 @@ fn get_autosuggestion_performer(
             return nothing;
         };
 
-        // Check if the line ends with double spaces - if so, try AI suggestion first
-        if search_string.ends_with("  ") {
-            // Try to get LLM suggestion first when double space is present
-            let github_token_opt = vars.get(L!("GITHUB_TOKEN"))
+        if llm_mode {
+            let github_token_opt = vars
+                .get(L!("GITHUB_TOKEN"))
                 .map(|v| v.as_string().to_string())
                 .or_else(|| std::env::var("GITHUB_TOKEN").ok());
 
-            if let Some(github_token) = github_token_opt {
-                // Get last 15 commands for context
-                let history_size = history.size();
-                let mut recent_commands = Vec::new();
+            let Some(github_token) = github_token_opt else {
+                return nothing;
+            };
 
-                if history_size > 0 {
-                    let num_items = std::cmp::min(10, history_size);
-                    for i in (0..num_items).rev() {
-                        if let Some(item) = history.item_at_index(i + 1) {
-                            let full_command: WString = item.str().to_owned();
-                            recent_commands.push(full_command);
-                        }
-                    }
-                }
-
-                // Build prompt with recent commands as context
-                let mut prompt = String::new();
-                if !recent_commands.is_empty() {
-                    prompt.push_str("# Fish Shell Command History:\n```fish\n");
-                    for cmd in &recent_commands {
-                        prompt.push_str(&cmd.to_string());
-                        prompt.push('\n');
-                    }
-                }
-                prompt.push_str(&search_string.to_string());
-
-                // Call LLM with built-in timeout
-                match copilot_autocomplete(
-                    &prompt,
-                    &github_token,
-                    Some(128),  // max_tokens - slightly increased
-                    Some(0.), // temperature - slightly higher for more creativity
-                    Some(vec!["\n".to_string()]), // stop at newlines
-                    Some("fish"), // language
-                    None, // no suffix
-                    false, // is_copilot_token
-                ) {
-                    Ok(llm_completion) => {
-                        // Clean and use the LLM response
-                        let cleaned = llm_completion.trim();
-
-                        if !cleaned.is_empty() {
-                            // Build the full suggestion: user input + LLM completion
-                            let mut full_suggestion = WString::new();
-                            full_suggestion.push_utfstr(search_string);
-
-                            // Check if LLM response already includes what user typed
-                            if cleaned.starts_with(&search_string.to_string()) {
-                                // LLM included the prompt, use as-is
-                                full_suggestion = WString::from(cleaned);
-                            } else {
-                                // LLM gave just the completion, append it
-                                full_suggestion.push_str(cleaned);
-                            }
-
-                            // Return the AI suggestion immediately
-                            return AutosuggestionResult::new(
-                                command_line,
-                                search_string_range,
-                                full_suggestion,
-                                true, // AI completions are case-insensitive
-                                /*is_whole_item_from_history=*/ false,
-                            );
-                        }
-                    }
-                    Err(_) => {
-                        // LLM failed, continue with normal flow
+            let history_size = history.size();
+            let mut recent_commands = Vec::new();
+            if history_size > 0 {
+                let num_items = std::cmp::min(10, history_size);
+                for i in (0..num_items).rev() {
+                    if let Some(item) = history.item_at_index(i + 1) {
+                        recent_commands.push(item.str().to_owned());
                     }
                 }
             }
+
+            let mut prompt = String::new();
+            if !recent_commands.is_empty() {
+                prompt.push_str("# Fish Shell Command History:\n```fish\n");
+                for cmd in &recent_commands {
+                    prompt.push_str(&cmd.to_string());
+                    prompt.push('\n');
+                }
+            }
+            prompt.push_str(&search_string.to_string());
+
+            let llm_completion = match copilot_autocomplete(
+                &prompt,
+                &github_token,
+                Some(128),
+                Some(0.),
+                Some(vec!["\n".to_string()]),
+                Some("fish"),
+                None,
+                false,
+            ) {
+                Ok(text) => text,
+                Err(_) => return nothing,
+            };
+
+            let cleaned = llm_completion.trim();
+            if cleaned.is_empty() {
+                return nothing;
+            }
+
+            // The display layer (combine_command_and_autosuggestion) expects the
+            // suggestion text to start with whatever the user has already typed
+            // (the search_string), then continue with the new completion. Preserve
+            // trailing whitespace in search_string verbatim — the user typed it.
+            let full_suggestion = if cleaned.starts_with(&search_string.to_string()) {
+                WString::from(cleaned)
+            } else {
+                let mut s = WString::new();
+                s.push_utfstr(search_string);
+                s.push_str(cleaned);
+                s
+            };
+
+            return AutosuggestionResult::new(
+                command_line,
+                search_string_range,
+                full_suggestion,
+                true,
+                /*is_whole_item_from_history=*/ false,
+            );
         }
 
         // Search history for a matching item unless this line is not a continuation line or quoted.
@@ -4935,8 +4932,6 @@ fn get_autosuggestion_performer(
             complete(&command_line[..would_be_cursor], complete_flags, &ctx);
 
         let suggestion = if completions.is_empty() {
-            // No completions found, and if we haven't already tried AI (double space case),
-            // we don't have a fallback suggestion
             WString::new()
         } else {
             sort_and_prioritize(&mut completions, complete_flags);
@@ -5059,6 +5054,33 @@ impl<'a> Reader<'a> {
             el.text().to_owned(),
             el.position(),
             self.history.clone(),
+            /*llm_mode=*/ false,
+        );
+        let canary = Rc::downgrade(&self.canary);
+        let completion = move |zelf: &mut Reader, result| {
+            if canary.upgrade().is_none() {
+                return;
+            }
+            zelf.autosuggest_completed(result);
+        };
+        debounce_autosuggestions().perform_with_completion(performer, completion);
+    }
+
+    /// Force an LLM-backed autosuggestion regardless of any current suggestion or
+    /// in-flight request. Invoked by the `llm-suggest` bindable function.
+    fn force_llm_autosuggestion(&mut self) {
+        if !self.can_autosuggest() {
+            return;
+        }
+        let el = &self.data.command_line;
+        self.data.autosuggestion.clear();
+        self.data.in_flight_autosuggest_request = el.text().to_owned();
+        let performer = get_autosuggestion_performer(
+            self.parser,
+            el.text().to_owned(),
+            el.position(),
+            self.history.clone(),
+            /*llm_mode=*/ true,
         );
         let canary = Rc::downgrade(&self.canary);
         let completion = move |zelf: &mut Reader, result| {
