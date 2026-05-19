@@ -3,13 +3,14 @@
 ## --- WRITTEN MANUALLY ---
 
 function __fish_cargo
-    cargo --color=never $argv
+    set -l tmp $__fish_cargo_wrapping cargo --color=never $argv
+    RUSTUP_AUTO_INSTALL=0 $tmp
 end
 
 set -l __fish_cargo_subcommands (__fish_cargo --list 2>&1 | string replace -rf '^\s+([^\s]+)\s*(.*)' '$1\t$2' | string escape)
 
-complete -c cargo -f -c cargo -n __fish_use_subcommand -a "$__fish_cargo_subcommands"
-complete -c cargo -x -c cargo -n '__fish_seen_subcommand_from help' -a "$__fish_cargo_subcommands"
+complete -c cargo -f -n __fish_use_subcommand -a "$__fish_cargo_subcommands"
+complete -c cargo -x -n '__fish_seen_subcommand_from help' -a "$__fish_cargo_subcommands"
 
 for x in bench b build c check rustc t test
     complete -c cargo -x -n "__fish_seen_subcommand_from $x" -l bench -a "(__fish_cargo bench --bench 2>&1 | string replace -rf '^\s+' '')"
@@ -34,8 +35,7 @@ end
 # have an easy way to do that in the `complete` machinery at this time.
 function __fish_cargo_targets
     if command -q rustup
-        functions -q __rustup_installed_targets || complete -C"rustup " &>/dev/null
-        __rustup_installed_targets
+        rustup target list | string replace -rf "^(\S+) \(installed\)" '$1'
     else
         rustc --print target-list
     end
@@ -846,7 +846,7 @@ if command -q cargo-asm
     # Warning: this will build the project and can take time! We make sure to only call it if it's not a switch so completions
     # for --foo will always be fast.
     if command -q timeout
-        complete -c cargo -n "__fish_seen_subcommand_from asm; and not __fish_is_switch" -xa "(timeout 1 __fish_cargo asm)"
+        complete -c cargo -n "__fish_seen_subcommand_from asm; and not __fish_is_switch" -xa "(__fish_cargo_wrapping={timeout,1} __fish_cargo asm)"
     else
         complete -c cargo -n "__fish_seen_subcommand_from asm; and not __fish_is_switch" -xa "(__fish_cargo asm)"
     end

@@ -8,18 +8,10 @@ linux_task:
           container: &step
               image: ghcr.io/krobelus/fish-ci/alpine:latest
               memory: 4GB
-        - name: jammy
+        - name: ubuntu-oldest-supported
           container:
               <<: *step
-              image: ghcr.io/krobelus/fish-ci/jammy:latest
-        # - name: jammy-asan
-        #   container:
-        #       <<: *step
-        #       image: ghcr.io/krobelus/fish-ci/jammy-asan:latest
-        # - name: focal-32bit
-        #   container:
-        #       <<: *step
-        #       image: ghcr.io/krobelus/fish-ci/focal-32bit:latest
+              image: ghcr.io/krobelus/fish-ci/ubuntu-oldest-supported:latest
     tests_script:
         # cirrus at times gives us 32 procs and 2 GB of RAM
         # Unrestriced parallelism results in OOM
@@ -31,34 +23,14 @@ linux_task:
         - ninja fish_run_tests
     only_if: $CIRRUS_REPO_OWNER == 'fish-shell'
 
-linux_arm_task:
-    matrix:
-        - name: focal-arm64
-          arm_container:
-              image: ghcr.io/fish-shell/fish-ci/focal-arm64
-        - name: jammy-armv7-32bit
-          arm_container:
-              image: ghcr.io/fish-shell/fish-ci/jammy-armv7-32bit
-    tests_script:
-        # cirrus at times gives us 32 procs and 2 GB of RAM
-        # Unrestriced parallelism results in OOM
-        - lscpu || true
-        - (cat /proc/meminfo | grep MemTotal) || true
-        - mkdir build && cd build
-        - FISH_TEST_MAX_CONCURRENCY=6 cmake -G Ninja -DCMAKE_BUILD_TYPE=Debug ..
-        - ninja -j 6 fish
-        - file ./fish
-        - ninja fish_run_tests
-    # CI task disabled during RIIR transition
-    only_if: false && $CIRRUS_REPO_OWNER == 'fish-shell'
-
 freebsd_task:
     matrix:
-        - name: FreeBSD 14
+        - name: FreeBSD Stable
           freebsd_instance:
-              image: freebsd-14-3-release-amd64-ufs
+              image: freebsd-15-0-release-amd64-ufs # updatecli.d/cirrus-freebsd.yml
     tests_script:
-        - pkg install -y cmake-core devel/pcre2 devel/ninja lang/rust misc/py-pexpect git-lite
+        - pkg update
+        - pkg install -y cmake-core devel/pcre2 devel/ninja gettext git-lite lang/rust misc/py-pexpect
         # libclang.so is a required build dependency for rust-c++ ffi bridge
         - pkg install -y llvm
         # BSDs have the following behavior: root may open or access files even if

@@ -1,12 +1,11 @@
-mod config_paths;
+pub mod config_paths;
 pub mod environment;
 mod environment_impl;
 pub mod var;
-pub use config_paths::CONFIG_PATHS;
 
-use crate::common::ToCString;
 pub use environment::*;
-use std::sync::{atomic::AtomicUsize, Mutex};
+use fish_widestring::ToCString;
+use std::sync::{Mutex, atomic::AtomicUsize};
 pub use var::*;
 
 /// Limit `read` to 1 GiB (bytes, not wide chars) by default. This can be overridden with the
@@ -23,7 +22,7 @@ static SETENV_LOCK: Mutex<()> = Mutex::new(());
 /// environment variables.
 ///
 /// As values could contain non-unicode characters, they must first be converted from &wstr to a
-/// `CString` with [`crate::common::wcs2zstring()`].
+/// `CString` with [`fish_widestring::wcs2zstring()`].
 pub fn setenv_lock<S1: ToCString, S2: ToCString>(name: S1, value: S2, overwrite: bool) {
     let name = name.to_cstring();
     let value = value.to_cstring();

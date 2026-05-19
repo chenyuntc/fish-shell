@@ -1,3 +1,4 @@
+# localization: skip(private)
 function __fish_systemctl --description 'Call systemctl with some options from the current commandline'
     # We don't want to complete with ANSI color codes
     set -lu SYSTEMD_COLORS
@@ -41,7 +42,7 @@ function __fish_systemctl --description 'Call systemctl with some options from t
             set -q _flag_state; or set _flag_state enabled
         case start
             # Running `start` on an already started unit isn't an _error_, but useless.
-            set -q _flag_state; or set _flag_state dead,failed
+            set -q _flag_state; or set _flag_state dead,failed,disabled
         case mask
             set -q _flag_state; or set _flag_state loaded
         case unmask

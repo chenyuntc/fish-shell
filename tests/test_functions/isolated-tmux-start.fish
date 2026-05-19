@@ -1,10 +1,10 @@
-function isolated-tmux-start
+function isolated-tmux-start --wraps fish
     set -l tmpdir (mktemp -d)
     cd $tmpdir
 
     echo 'set -g mode-keys emacs' >.tmux.conf
 
-    function isolated-tmux --inherit-variable tmpdir
+    function isolated-tmux --inherit-variable tmpdir --wraps tmux
         # tmux can't handle session sockets in paths that are too long, and macOS has a very long
         # $TMPDIR, so use a relative path - except macOS doesn't have `realpath --relative-to`...
         # Luckily, we don't need to call tmux from other directories, so just make sure no one
@@ -26,23 +26,52 @@ function isolated-tmux-start
         or sleep 0.3
     end
 
+    function sleep-until
+        set -l cmd $argv[1]
+        set -l i 0
+        while [ $i -lt 100 ] && not eval "$cmd" >/dev/null
+            tmux-sleep
+            set i (math $i + 1)
+        end
+        if [ $i -eq 100 ]
+            printf '%s\n' "timeout waiting for $cmd" >&2
+            exit 1
+        end
+    end
+
     set -l fish (status fish-path)
-    isolated-tmux new-session -x 80 -y 10 -d $fish -C '
+    set -l size -x 80 -y 10
+    set -l greeting_file
+    if not test -f $greeting_file
+        printf >$__fish_config_dir/functions/fish_greeting.fish %s \
+            'function fish_greeting; end' 2>/dev/null
+    end
+    isolated-tmux new-session $size -d $fish -C '
         # This is similar to "tests/interactive.config".
-        function fish_greeting; end
         function fish_prompt; printf "prompt $status_generation> "; end
         # No autosuggestion from older history.
         set fish_history ""
-    ' $isolated_tmux_fish_extra_args
+        # No transient prompt.
+        set fish_transient_prompt 0
+        set -g CDPATH
+    ' $argv
     # Set the correct permissions for the newly created socket to allow future connections.
     # This is required at least under WSL or else each invocation will return a permissions error.
     chmod 777 .tmux-socket
 
+    # Resize window so we can attach to tmux session without changing panel size.
+    isolated-tmux resize-window $size
+
+    if test "$tmux_wait" = false
+        return
+    end
+
     # Loop a bit, until we get an initial prompt.
-    for i in (seq 25)
-        if string match -q '*prompt*' -- (isolated-tmux capture-pane -p)
-            break
+    for i in (seq 50)
+        if test -n "$(isolated-tmux capture-pane -p)"
+            return
         end
         sleep .2
     end
+    echo "error: isolated-tmux-start timed out waiting for non-empty first prompt" >&2
 end

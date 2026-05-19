@@ -1,26 +1,26 @@
-#[cfg(not(target_has_atomic = "64"))]
-use portable_atomic::AtomicU64;
+use crate::fd_readable_set::{FdReadableSet, Timeout};
+use crate::flog::flog;
+use crate::portable_atomic::AtomicU64;
+use crate::threads::assert_is_background_thread;
+use crate::wutil::perror_nix;
+use cfg_if::cfg_if;
+use errno::errno;
+use fish_common::exit_without_destructors;
+use fish_util::perror;
+use libc::{EAGAIN, EINTR, EWOULDBLOCK};
 use std::collections::HashMap;
 use std::os::unix::prelude::*;
-#[cfg(target_has_atomic = "64")]
-use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
-use crate::common::exit_without_destructors;
-use crate::fd_readable_set::{FdReadableSet, Timeout};
-use crate::fds::AutoCloseFd;
-use crate::flog::FLOG;
-use crate::threads::assert_is_background_thread;
-use crate::wutil::perror;
-use errno::errno;
-use libc::{c_void, EAGAIN, EINTR, EWOULDBLOCK};
-
-#[cfg(not(HAVE_EVENTFD))]
-use crate::fds::{make_autoclose_pipes, make_fd_nonblocking};
-#[cfg(HAVE_EVENTFD)]
-use libc::{EFD_CLOEXEC, EFD_NONBLOCK};
+cfg_if!(
+    if #[cfg(have_eventfd)] {
+        use libc::{EFD_CLOEXEC, EFD_NONBLOCK};
+    } else {
+        use crate::fds::{make_autoclose_pipes, make_fd_nonblocking};
+    }
+);
 
 /// An event signaller implemented using a file descriptor, so it can plug into
 /// [`select()`](libc::select).
@@ -33,7 +33,7 @@ use libc::{EFD_CLOEXEC, EFD_NONBLOCK};
 pub struct FdEventSignaller {
     // Always the read end of the fd; maybe the write end as well.
     fd: OwnedFd,
-    #[cfg(not(HAVE_EVENTFD))]
+    #[cfg(not(have_eventfd))]
     write: OwnedFd,
 }
 
@@ -41,29 +41,33 @@ impl FdEventSignaller {
     /// The default constructor will abort on failure (fd exhaustion).
     /// This should only be used during startup.
     pub fn new() -> Self {
-        #[cfg(HAVE_EVENTFD)]
-        {
-            // Note we do not want to use EFD_SEMAPHORE because we are binary (not counting) semaphore.
-            let fd = unsafe { libc::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
-            if fd < 0 {
-                perror("eventfd");
-                exit_without_destructors(1);
-            }
-            Self {
-                fd: unsafe { OwnedFd::from_raw_fd(fd) },
-            }
-        }
-        #[cfg(not(HAVE_EVENTFD))]
-        {
-            // Implementation using pipes.
-            let Ok(pipes) = make_autoclose_pipes() else {
-                exit_without_destructors(1);
-            };
-            make_fd_nonblocking(pipes.read.as_raw_fd()).unwrap();
-            make_fd_nonblocking(pipes.write.as_raw_fd()).unwrap();
-            Self {
-                fd: pipes.read,
-                write: pipes.write,
+        cfg_if! {
+            if #[cfg(have_eventfd)] {
+                // Note we do not want to use EFD_SEMAPHORE because we are binary (not counting) semaphore.
+                let fd = unsafe { libc::eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK) };
+                if fd < 0 {
+                    perror("eventfd");
+                    exit_without_destructors(1);
+                }
+                use crate::fds::heightenize_fd;
+                let Ok(fd) = heightenize_fd(unsafe { OwnedFd::from_raw_fd(fd) }, true) else {
+                    perror("eventfd");
+                    exit_without_destructors(1);
+                };
+                Self {
+                    fd
+                }
+            } else {
+                // Implementation using pipes.
+                let Ok(pipes) = make_autoclose_pipes() else {
+                    exit_without_destructors(1);
+                };
+                make_fd_nonblocking(pipes.read.as_raw_fd()).unwrap();
+                make_fd_nonblocking(pipes.write.as_raw_fd()).unwrap();
+                Self {
+                    fd: pipes.read,
+                    write: pipes.write,
+                }
             }
         }
     }
@@ -80,19 +84,17 @@ impl FdEventSignaller {
         // If we are using eventfd, we want to read a single uint64.
         // If we are using pipes, read a lot; note this may leave data on the pipe if post has been
         // called many more times. In no case do we care about the data which is read.
-        #[cfg(HAVE_EVENTFD)]
-        let mut buff = [0_u64; 1];
-        #[cfg(not(HAVE_EVENTFD))]
-        let mut buff = [0_u8; 1024];
+        cfg_if!(
+            if #[cfg(have_eventfd)] {
+                let mut buff = [0_u64; 1];
+            } else {
+                let mut buff = [0_u8; 1024];
+            }
+        );
         let mut ret;
         loop {
-            ret = unsafe {
-                libc::read(
-                    self.read_fd(),
-                    &mut buff as *mut _ as *mut c_void,
-                    std::mem::size_of_val(&buff),
-                )
-            };
+            ret =
+                unsafe { libc::read(self.read_fd(), buff.as_mut_ptr().cast(), size_of_val(&buff)) };
             if ret >= 0 || errno().0 != EINTR {
                 break;
             }
@@ -107,10 +109,13 @@ impl FdEventSignaller {
     /// This retries on EINTR.
     pub fn post(&self) {
         // eventfd writes uint64; pipes write 1 byte.
-        #[cfg(HAVE_EVENTFD)]
-        let c = 1_u64;
-        #[cfg(not(HAVE_EVENTFD))]
-        let c = 1_u8;
+        cfg_if!(
+            if #[cfg(have_eventfd)] {
+                let c = 1_u64;
+            } else {
+                let c = 1_u8;
+            }
+        );
         let mut ret;
         loop {
             let bytes = c.to_ne_bytes();
@@ -126,7 +131,7 @@ impl FdEventSignaller {
         if let Err(err) = ret {
             // EAGAIN occurs if either the pipe buffer is full or the eventfd overflows (very unlikely).
             if ![nix::Error::EAGAIN, nix::Error::EWOULDBLOCK].contains(&err) {
-                perror("write");
+                perror_nix("write", err);
             }
         }
     }
@@ -135,6 +140,7 @@ impl FdEventSignaller {
     /// If `wait` is set, wait until it is readable; this does not consume the event
     /// but guarantees that the next call to wait() will not block.
     /// Return true if readable, false if not readable, or not interrupted by a signal.
+    #[cfg(test)]
     pub fn poll(&self, wait: bool /* = false */) -> bool {
         let timeout = if wait {
             Timeout::Forever
@@ -146,10 +152,13 @@ impl FdEventSignaller {
 
     /// Return the fd to write to.
     fn write_fd(&self) -> RawFd {
-        #[cfg(HAVE_EVENTFD)]
-        return self.fd.as_raw_fd();
-        #[cfg(not(HAVE_EVENTFD))]
-        return self.write.as_raw_fd();
+        cfg_if! {
+            if #[cfg(have_eventfd)] {
+                self.fd.as_raw_fd()
+            } else {
+                self.write.as_raw_fd()
+            }
+        }
     }
 }
 
@@ -173,13 +182,13 @@ impl From<u64> for FdMonitorItemId {
 /// The callback type used by [`FdMonitorItem`]. It is passed a mutable reference to the
 /// `FdMonitorItem`'s [`FdMonitorItem::fd`]. If the fd is closed, the callback will not
 /// be invoked again.
-pub type Callback = Box<dyn Fn(&mut AutoCloseFd) + Send + Sync>;
+pub type Callback = Box<dyn Fn(&mut Option<OwnedFd>) + Send + Sync>;
 
 /// An item containing an fd and callback, which can be monitored to watch when it becomes readable
 /// and invoke the callback.
 pub struct FdMonitorItem {
     /// The fd to monitor
-    fd: AutoCloseFd,
+    fd: Option<OwnedFd>,
     /// A callback to be invoked when the fd is readable, or for another reason given by the wake reason.
     /// If the fd is invalid on return from the function, then the item is removed from the [`FdMonitor`] set.
     callback: Callback,
@@ -189,7 +198,7 @@ impl FdMonitorItem {
     /// Invoke this item's callback because the fd is readable.
     /// If the given fd is closed, it will be removed from the [`FdMonitor`] set.
     fn service(&mut self) {
-        (self.callback)(&mut self.fd)
+        (self.callback)(&mut self.fd);
     }
 }
 
@@ -199,7 +208,7 @@ pub struct FdMonitor {
     /// Our self-signaller, used to wake up the background thread out of select().
     change_signaller: Arc<FdEventSignaller>,
     /// The data shared between the background thread and the `FdMonitor` instance.
-    data: Arc<Mutex<SharedData>>,
+    data: Arc<SharedData>,
     /// The last ID assigned or `0` if none.
     last_id: AtomicU64,
 }
@@ -214,13 +223,25 @@ const _: () = {
 };
 
 /// Data shared between the `FdMonitor` instance and its associated `BackgroundFdMonitor`.
-struct SharedData {
+struct LockedSharedData {
     /// The map of items. This may be modified by the main thread with the mutex locked.
     items: HashMap<FdMonitorItemId, FdMonitorItem>,
     /// Whether the background thread is running.
     running: bool,
     /// Used to signal that the background thread should terminate.
     terminate: bool,
+}
+struct SharedData {
+    /// Note the locking here is very coarse and the lock is held while servicing items.
+    /// This means that an item which reads a lot of data may prevent adding other items.
+    /// When we do true multithreaded execution, we may want to make the locking more fine-grained (per-item).
+    locked: Mutex<LockedSharedData>,
+
+    /// Used to know when the monitor thread is done with an item, in particular, when
+    /// it's safe to close its fd.
+    /// Modification and reading a baseline value must be done within the `locked` context.
+    /// Checking for changes against the baseline can be done without acquiring `locked`.
+    select_generation: (Mutex<usize>, Condvar),
 }
 
 /// The background half of the fd monitor, running on its own thread.
@@ -229,23 +250,21 @@ struct BackgroundFdMonitor {
     /// in the poke list, or terminate has been set.
     change_signaller: Arc<FdEventSignaller>,
     /// The data shared between the background thread and the `FdMonitor` instance.
-    /// Note the locking here is very coarse and the lock is held while servicing items.
-    /// This means that an item which reads a lot of data may prevent adding other items.
-    /// When we do true multithreaded execution, we may want to make the locking more fine-grained (per-item).
-    data: Arc<Mutex<SharedData>>,
+    data: Arc<SharedData>,
 }
 
 impl FdMonitor {
     /// Add an item to the monitor. Returns the [`FdMonitorItemId`] assigned to the item.
-    pub fn add(&self, fd: AutoCloseFd, callback: Callback) -> FdMonitorItemId {
-        assert!(fd.is_valid());
-
+    pub fn add(&self, fd: OwnedFd, callback: Callback) -> FdMonitorItemId {
         let item_id = self.last_id.fetch_add(1, Ordering::Relaxed) + 1;
         let item_id = FdMonitorItemId(item_id);
-        let item: FdMonitorItem = FdMonitorItem { fd, callback };
+        let item: FdMonitorItem = FdMonitorItem {
+            fd: Some(fd),
+            callback,
+        };
         let start_thread = {
             // Lock around a local region
-            let mut data = self.data.lock().expect("Mutex poisoned!");
+            let mut data = self.data.locked.lock().expect("Mutex poisoned!");
 
             // Assign an id and add the item.
             let old_value = data.items.insert(item_id, item);
@@ -258,7 +277,7 @@ impl FdMonitor {
         };
 
         if start_thread {
-            FLOG!(fd_monitor, "Thread starting");
+            flog!(fd_monitor, "Thread starting");
             let background_monitor = BackgroundFdMonitor {
                 data: Arc::clone(&self.data),
                 change_signaller: Arc::clone(&self.change_signaller),
@@ -274,27 +293,51 @@ impl FdMonitor {
         item_id
     }
 
+    pub fn with_fd(&self, item_id: FdMonitorItemId, cb: impl FnOnce(BorrowedFd)) {
+        let data = self.data.locked.lock().expect("Mutex poisoned!");
+        if let Some(fd) = &data.items.get(&item_id).unwrap().fd {
+            cb(fd.as_fd());
+        }
+    }
+
     /// Remove an item from the monitor and return its file descriptor.
     /// Note we may remove an item whose fd is currently being waited on in select(); this is
     /// considered benign because the underlying item will no longer be present and so its
     /// callback will not be invoked.
-    pub fn remove_item(&self, item_id: FdMonitorItemId) -> AutoCloseFd {
+    pub fn remove_item(&self, item_id: FdMonitorItemId) -> Option<OwnedFd> {
         assert!(item_id.0 > 0, "Invalid item id!");
-        let mut data = self.data.lock().expect("Mutex poisoned!");
+
+        let (gen_lock, gen_cond) = &self.data.select_generation;
+
+        let mut data = self.data.locked.lock().expect("Mutex poisoned!");
         let removed = data.items.remove(&item_id).expect("Item ID not found");
+        let generation = *gen_lock.lock().expect("Mutex poisoned!");
         drop(data);
+
         // Allow it to recompute the wait set.
         self.change_signaller.post();
+
+        // Wait for select() to return since we do not know when the caller will close
+        // the descriptor and doing so has unspecified results (e.g. occasionally
+        // Cygwin returns EFAULT)
+        {
+            let lock = gen_lock.lock().expect("Mutex poisoned!");
+            drop(gen_cond.wait_while(lock, |val| *val == generation));
+        }
+
         removed.fd
     }
 
     pub fn new() -> Self {
         Self {
-            data: Arc::new(Mutex::new(SharedData {
-                items: HashMap::new(),
-                running: false,
-                terminate: false,
-            })),
+            data: Arc::new(SharedData {
+                locked: Mutex::new(LockedSharedData {
+                    items: HashMap::new(),
+                    running: false,
+                    terminate: false,
+                }),
+                select_generation: Default::default(),
+            }),
             change_signaller: Arc::new(FdEventSignaller::new()),
             last_id: AtomicU64::new(0),
         }
@@ -353,13 +396,12 @@ impl BackgroundFdMonitor {
             fds.add(change_signal_fd);
 
             // Grab the lock and snapshot the item_ids. Skip items with invalid fds.
-            let mut data = self.data.lock().expect("Mutex poisoned!");
+            let mut data = self.data.locked.lock().expect("Mutex poisoned!");
             item_ids.clear();
             item_ids.reserve(data.items.len());
             for (item_id, item) in &data.items {
-                let fd = item.fd.as_raw_fd();
-                if fd >= 0 {
-                    fds.add(fd);
+                if let Some(fd) = &item.fd {
+                    fds.add(fd.as_raw_fd());
                     item_ids.push(*item_id);
                 }
             }
@@ -387,17 +429,22 @@ impl BackgroundFdMonitor {
             //
             // Note that WSLv1 doesn't throw EBADF if the fd is closed is mid-select.
             drop(data);
-            let ret =
-                fds.check_readable(timeout.map(Timeout::Duration).unwrap_or(Timeout::Forever));
-            // Cygwin reports ret < 0 && errno == 0 as success.
+            let ret = fds.check_readable(timeout.map_or(Timeout::Forever, Timeout::Duration));
+            // TODO Cygwin reports ret < 0 && errno == 0 as success. Remove the workaround for msys2-runtime>=3.6.9, see https://github.com/msys2/msys2-runtime/issues/308#issuecomment-4301066343
             let err = errno().0;
-            if ret < 0 && !matches!(err, libc::EINTR | libc::EBADF) && !(cfg!(cygwin) && err == 0) {
+            if ret < 0 && !matches!(err, libc::EINTR | libc::EAGAIN) && !(cfg!(cygwin) && err == 0)
+            {
                 // Surprising error
                 perror("select");
             }
 
             // Re-acquire the lock.
-            data = self.data.lock().expect("Mutex poisoned!");
+            data = self.data.locked.lock().expect("Mutex poisoned!");
+
+            // Signal any thread waiting to remove an item
+            let (gen_lock, gen_cond) = &self.data.select_generation;
+            *gen_lock.lock().expect("Mutex poisoned!") += 1;
+            gen_cond.notify_all();
 
             // For each item id that we snapshotted, if the corresponding item is still in our
             // set of active items and its fd was readable, then service it.
@@ -407,7 +454,7 @@ impl BackgroundFdMonitor {
                     // Note there is no risk of an ABA problem because ItemIDs are never recycled.
                     continue;
                 };
-                if fds.test(item.fd.as_raw_fd()) {
+                if item.fd.as_ref().is_some_and(|fd| fds.test(fd.as_raw_fd())) {
                     item.service();
                 }
             }
@@ -427,7 +474,7 @@ impl BackgroundFdMonitor {
                         data.running,
                         "Thread should be running because we're that thread"
                     );
-                    FLOG!(fd_monitor, "Thread exiting");
+                    flog!(fd_monitor, "Thread exiting");
                     data.running = false;
                     break;
                 }
@@ -440,12 +487,169 @@ impl BackgroundFdMonitor {
 /// fds arounds; this is why it's very hacky!
 impl Drop for FdMonitor {
     fn drop(&mut self) {
-        self.data.lock().expect("Mutex poisoned!").terminate = true;
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(cfg!(test));
+        }
+        self.data.locked.lock().expect("Mutex poisoned!").terminate = true;
         self.change_signaller.post();
 
         // Safety: see note above.
-        while self.data.lock().expect("Mutex poisoned!").running {
+        while self.data.locked.lock().expect("Mutex poisoned!").running {
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::portable_atomic::AtomicU64;
+    use std::fs::File;
+    use std::io::Write as _;
+    use std::os::fd::OwnedFd;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crate::fd_monitor::{FdEventSignaller, FdMonitor};
+    use crate::fds::make_autoclose_pipes;
+    use crate::tests::prelude::*;
+
+    /// Helper to make an item which counts how many times its callback was invoked.
+    ///
+    /// This could be structured differently to avoid the `Mutex` on `writer`, but it's not worth it
+    /// since this is just used for test purposes.
+    struct ItemMaker {
+        pub length_read: AtomicUsize,
+        pub total_calls: AtomicUsize,
+        item_id: AtomicU64,
+        pub always_close: bool,
+        pub writer: Mutex<Option<File>>,
+    }
+
+    impl ItemMaker {
+        pub fn insert_new_into(monitor: &FdMonitor) -> Arc<Self> {
+            Self::insert_new_into2(monitor, |_| {})
+        }
+
+        pub fn insert_new_into2<F: Fn(&mut Self)>(monitor: &FdMonitor, config: F) -> Arc<Self> {
+            let pipes = make_autoclose_pipes().expect("fds exhausted!");
+
+            let mut result = ItemMaker {
+                length_read: 0.into(),
+                total_calls: 0.into(),
+                item_id: 0.into(),
+                always_close: false,
+                writer: Mutex::new(Some(File::from(pipes.write))),
+            };
+
+            config(&mut result);
+
+            let result = Arc::new(result);
+            let callback = {
+                let result = Arc::clone(&result);
+                move |fd: &mut Option<OwnedFd>| result.callback(fd)
+            };
+            let fd = pipes.read;
+            let item_id = monitor.add(fd, Box::new(callback));
+            result.item_id.store(u64::from(item_id), Ordering::Relaxed);
+
+            result
+        }
+
+        fn callback(&self, fd: &mut Option<OwnedFd>) {
+            let mut buf = [0u8; 1024];
+            let res = nix::unistd::read(fd.as_ref().unwrap(), &mut buf);
+            let amt = res.expect("read error!");
+            self.length_read.fetch_add(amt, Ordering::Relaxed);
+            let was_closed = amt == 0;
+
+            self.total_calls.fetch_add(1, Ordering::Relaxed);
+            if was_closed || self.always_close {
+                drop(fd.take());
+            }
+        }
+
+        /// Write 42 bytes to our write end.
+        fn write42(&self) {
+            let buf = [0u8; 42];
+            let mut writer = self.writer.lock().expect("Mutex poisoned!");
+            writer
+                .as_mut()
+                .unwrap()
+                .write_all(&buf)
+                .expect("Error writing 42 bytes to pipe!");
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn fd_monitor_items() {
+        test_init();
+        let monitor = FdMonitor::new();
+
+        // Item which will never receive data or be called.
+        let item_never = ItemMaker::insert_new_into(&monitor);
+
+        // Item which should get exactly 42 bytes.
+        let item42 = ItemMaker::insert_new_into(&monitor);
+
+        // Item which should get 42 bytes then get notified it is closed.
+        let item42_then_close = ItemMaker::insert_new_into(&monitor);
+
+        // Item which should get a callback exactly once.
+        let item_oneshot = ItemMaker::insert_new_into2(&monitor, |item| {
+            item.always_close = true;
+        });
+
+        item42.write42();
+        item42_then_close.write42();
+        *item42_then_close.writer.lock().expect("Mutex poisoned!") = None;
+        item_oneshot.write42();
+
+        // May need to loop here to ensure our fd_monitor gets scheduled. See #7699.
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(84));
+            if item_oneshot.total_calls.load(Ordering::Relaxed) > 0 {
+                break;
+            }
+        }
+
+        drop(monitor);
+
+        assert_eq!(item_never.length_read.load(Ordering::Relaxed), 0);
+
+        assert_eq!(item42.length_read.load(Ordering::Relaxed), 42);
+
+        assert_eq!(item42_then_close.length_read.load(Ordering::Relaxed), 42);
+        assert_eq!(item42_then_close.total_calls.load(Ordering::Relaxed), 2);
+
+        assert_eq!(item_oneshot.length_read.load(Ordering::Relaxed), 42);
+        assert_eq!(item_oneshot.total_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_fd_event_signaller() {
+        let sema = FdEventSignaller::new();
+        assert!(!sema.try_consume());
+        assert!(!sema.poll(false));
+
+        // Post once.
+        sema.post();
+        assert!(sema.poll(false));
+        assert!(sema.poll(false));
+        assert!(sema.try_consume());
+        assert!(!sema.poll(false));
+        assert!(!sema.try_consume());
+
+        // Posts are coalesced.
+        sema.post();
+        sema.post();
+        sema.post();
+        assert!(sema.poll(false));
+        assert!(sema.poll(false));
+        assert!(sema.try_consume());
+        assert!(!sema.poll(false));
+        assert!(!sema.try_consume());
     }
 }

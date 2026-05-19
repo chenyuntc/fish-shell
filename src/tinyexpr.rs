@@ -31,9 +31,10 @@ use std::{
 };
 
 use crate::{
-    wchar::prelude::*,
-    wutil::{wcstod::wcstod_underscores, wgettext, Error as wcstodError},
+    prelude::*,
+    wutil::{Error as wcstodError, wcstod::wcstod_underscores},
 };
+use fish_common::assert_sorted_by_name;
 
 #[derive(Clone, Copy)]
 enum Function {
@@ -196,11 +197,7 @@ fn maximum(n: &[f64]) -> f64 {
 
         if a == b {
             // treat +0 as larger than -0
-            if a.is_sign_positive() {
-                a
-            } else {
-                b
-            }
+            if a.is_sign_positive() { a } else { b }
         } else if a > b {
             a
         } else {
@@ -220,11 +217,7 @@ fn minimum(n: &[f64]) -> f64 {
 
         if a == b {
             // treat -0 as smaller than +0
-            if a.is_sign_negative() {
-                a
-            } else {
-                b
-            }
+            if a.is_sign_negative() { a } else { b }
         } else if a < b {
             a
         } else {
@@ -249,8 +242,8 @@ fn ncr(n: f64, r: f64) -> f64 {
     let mut ur = r as u64;
 
     if ur > un / 2 {
-        ur = un - ur
-    };
+        ur = un - ur;
+    }
 
     let mut result = 1_u64;
     for i in 1..=ur {
@@ -286,12 +279,14 @@ const BUILTINS: &[(&wstr, Function)] = &[
         L!("bitxor"),
         Function::Fn2(|a, b| bitwise_op(a, b, BitXor::bitxor)),
     ),
+    #[allow(clippy::incompatible_msrv)]
     (L!("ceil"), Function::Fn1(f64::ceil)),
     (L!("cos"), Function::Fn1(f64::cos)),
     (L!("cosh"), Function::Fn1(f64::cosh)),
     (L!("e"), Function::Constant(E)),
     (L!("exp"), Function::Fn1(f64::exp)),
     (L!("fac"), Function::Fn1(fac)),
+    #[allow(clippy::incompatible_msrv)]
     (L!("floor"), Function::Fn1(f64::floor)),
     (L!("ln"), Function::Fn1(f64::ln)),
     (L!("log"), Function::Fn1(f64::log10)),
@@ -303,6 +298,7 @@ const BUILTINS: &[(&wstr, Function)] = &[
     (L!("npr"), Function::Fn2(npr)),
     (L!("pi"), Function::Constant(PI)),
     (L!("pow"), Function::Fn2(f64::powf)),
+    #[allow(clippy::incompatible_msrv)]
     (L!("round"), Function::Fn1(f64::round)),
     (L!("sin"), Function::Fn1(f64::sin)),
     (L!("sinh"), Function::Fn1(f64::sinh)),
@@ -351,7 +347,7 @@ impl<'s> State<'s> {
     }
 
     pub fn eval(&mut self) -> f64 {
-        return self.expr();
+        self.expr()
     }
 
     fn set_error(&mut self, kind: ErrorKind, pos_len: Option<(usize, usize)>) {
@@ -390,11 +386,11 @@ impl<'s> State<'s> {
                 Ok(num) => Some((consumed, Some(Token::Number(num)))),
                 Err(wcstodError::InvalidChar) => {
                     self.set_error(ErrorKind::Unknown, Some((self.pos + consumed, 1)));
-                    return Some((consumed, Some(Token::Error)));
+                    Some((consumed, Some(Token::Error)))
                 }
                 Err(wcstodError::Overflow) => {
                     self.set_error(ErrorKind::NumberTooLarge, Some((self.pos, consumed)));
-                    return Some((consumed, Some(Token::Error)));
+                    Some((consumed, Some(Token::Error)))
                 }
                 Err(wcstodError::Empty) => {
                     // We have a matches! above, this can't be?
@@ -567,7 +563,7 @@ impl<'s> State<'s> {
                     // a closing parenthesis should be more obvious.
                     //
                     // Vararg functions need at least one argument.
-                    let err = if f.arity().map(|arity| i < arity).unwrap_or(i == 0) {
+                    let err = if f.arity().map_or(i == 0, |arity| i < arity) {
                         ErrorKind::TooFewArgs
                     } else {
                         ErrorKind::TooManyArgs
@@ -602,9 +598,9 @@ impl<'s> State<'s> {
                 }
 
                 if !matches!(self.current, Token::Error | Token::End) && self.error.is_none() {
-                    self.set_error(ErrorKind::TooManyArgs, None)
+                    self.set_error(ErrorKind::TooManyArgs, None);
                 } else if self.no_specific_error() {
-                    self.set_error(ErrorKind::MissingClosingParen, None)
+                    self.set_error(ErrorKind::MissingClosingParen, None);
                 }
 
                 f64::NAN

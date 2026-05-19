@@ -1,5 +1,3 @@
-.. _fish_for_bash_users:
-
 Fish for bash users
 ===================
 
@@ -100,6 +98,15 @@ See :ref:`Shell variables <variables>` for more.
 .. [#] zsh also does not perform word splitting by default (the SH_WORD_SPLIT option controls this)
 
 .. _bash-globs:
+
+Variable defaults (``${my_variable:-"default value"}``)
+-------------------------------------------------------
+
+Fish doesn't have ``${my_variable:-fallback}`` for providing default values to unset variables. Instead, you can set default values by checking whether the variable has been set yet::
+
+  # Ensure XDG_CONFIG_HOME is set or use a default value
+  set -q XDG_CONFIG_HOME || set XDG_CONFIG_HOME $HOME/.config
+  # now use XDG_CONFIG_HOME as normal
 
 Wildcards (globs)
 -----------------
@@ -265,7 +272,7 @@ and could be written in other shells as
   xterm
   rxvt-unicode
   EOF
-  
+
 So heredocs really are minor syntactical sugar that introduces a lot of special rules, which is why fish doesn't have them. Pipes are a core concept, and are simpler and compose nicer.
 
 .. [#] For example, the "EOF" is just a convention, the terminator can be an arbitrary string, something like "THISISTHEEND" also works. And using ``<<-`` trims leading *tab* characters (but not other whitespace), so you can indent the lines, but only with tabs. Substitutions (variables, commands) are done on the heredoc by default, but not if the terminator is quoted: ``cat << "EOF"``.
@@ -320,7 +327,7 @@ and a rough fish equivalent::
 
       echo -s (prompt_hostname) \
       (set_color blue) (prompt_pwd) \
-      (set_color yellow) $prompt_symbol (set_color normal)
+      (set_color yellow) $prompt_symbol (set_color --reset)
   end
 
 This shows a few differences:
@@ -343,7 +350,7 @@ Fish's blocking constructs look a little different. They all start with a word, 
   done
 
   # becomes
-  
+
   for i in 1 2 3
      echo $i
   end
@@ -363,7 +370,7 @@ Fish's blocking constructs look a little different. They all start with a word, 
   }
 
   # becomes
-  
+
   begin
      echo Hello
   end

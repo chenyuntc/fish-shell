@@ -1,42 +1,41 @@
 //! Implementation of the read builtin.
 
 use super::prelude::*;
-use crate::common::escape;
-use crate::common::read_blocked;
-use crate::common::str2wcstring;
-use crate::common::unescape_string;
-use crate::common::valid_var_name;
-use crate::common::UnescapeStringStyle;
-use crate::env::EnvMode;
-use crate::env::Environment;
-use crate::env::READ_BYTE_LIMIT;
-use crate::env::{EnvVar, EnvVarFlags};
-use crate::input_common::decode_input_byte;
-use crate::input_common::DecodeState;
-use crate::input_common::InvalidPolicy;
-use crate::nix::isatty;
-use crate::reader::commandline_set_buffer;
-use crate::reader::reader_save_screen_state;
-use crate::reader::ReaderConfig;
-use crate::reader::{reader_pop, reader_push, reader_readline};
-use crate::tokenizer::Tokenizer;
-use crate::tokenizer::TOK_ACCEPT_UNFINISHED;
-use crate::tokenizer::TOK_ARGUMENT_LIST;
-use crate::tty_handoff::TtyHandoff;
-use crate::wcstringutil::split_about;
-use crate::wcstringutil::split_string_tok;
-use crate::wutil;
-use crate::wutil::encoding::zero_mbstate;
-use crate::wutil::perror;
+use crate::{
+    builtins::error::Error,
+    common::valid_var_name,
+    env::{EnvMode, EnvVar, EnvVarFlags, Environment as _, READ_BYTE_LIMIT},
+    err_fmt, err_str,
+    history::{HistoryId, MemoryHistoryId},
+    input_common::{DecodeState, InvalidPolicy, decode_utf8},
+    nix::isatty,
+    parse_execution::varname_error,
+    parser::ParserEnvSetMode,
+    reader::{
+        ReaderConfig, commandline_set_buffer, reader_pop, reader_push, reader_readline,
+        set_shell_modes_temporarily,
+    },
+    tokenizer::{TOK_ACCEPT_UNFINISHED, TOK_ARGUMENT_LIST, Tok, Tokenizer},
+    wutil,
+};
+use fish_common::{UnescapeStringStyle, escape, read_blocked, unescape_string};
+use fish_util::perror;
+use fish_wcstringutil::{split_about, split_string_tok};
+use fish_widestring::bytes2wcstring;
 use libc::SEEK_CUR;
-use std::num::NonZeroUsize;
-use std::os::fd::RawFd;
-use std::sync::atomic::Ordering;
+use std::{num::NonZeroUsize, os::fd::RawFd, sync::atomic::Ordering};
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum TokenOutputMode {
+    Expanded,
+    Raw,
+    Unescaped,
+}
 
 #[derive(Default)]
 struct Options {
     print_help: bool,
-    place: EnvMode,
+    place: ParserEnvSetMode,
     prompt: Option<WString>,
     prompt_str: Option<WString>,
     right_prompt: WString,
@@ -44,26 +43,25 @@ struct Options {
     // If a delimiter was given. Used to distinguish between the default
     // empty string and a given empty delimiter.
     delimiter: Option<WString>,
-    tokenize: bool,
+    token_mode: Option<TokenOutputMode>, // never expanded
     shell: bool,
     array: bool,
     silent: bool,
     split_null: bool,
-    to_stdout: bool,
-    nchars: usize,
+    nchars: Option<NonZeroUsize>,
     one_line: bool,
 }
 
 impl Options {
     fn new() -> Self {
         Options {
-            place: EnvMode::USER,
+            place: ParserEnvSetMode::user(EnvMode::empty()),
             ..Default::default()
         }
     }
 }
 
-const SHORT_OPTIONS: &wstr = L!(":ac:d:fghiLln:p:sStuxzP:UR:L");
+const SHORT_OPTIONS: &wstr = L!("ac:d:fghLln:p:sStuxzP:UR:L");
 const LONG_OPTIONS: &[WOption] = &[
     wopt(L!("array"), ArgType::NoArgument, 'a'),
     wopt(L!("command"), ArgType::RequiredArgument, 'c'),
@@ -83,9 +81,18 @@ const LONG_OPTIONS: &[WOption] = &[
     wopt(L!("shell"), ArgType::NoArgument, 'S'),
     wopt(L!("silent"), ArgType::NoArgument, 's'),
     wopt(L!("tokenize"), ArgType::NoArgument, 't'),
+    wopt(L!("tokenize-raw"), ArgType::NoArgument, '\x01'),
     wopt(L!("unexport"), ArgType::NoArgument, 'u'),
     wopt(L!("universal"), ArgType::NoArgument, 'U'),
 ];
+
+fn tokenize_flag(token_mode: TokenOutputMode) -> &'static wstr {
+    match token_mode {
+        TokenOutputMode::Expanded => panic!(),
+        TokenOutputMode::Raw => L!("--tokenize-raw"),
+        TokenOutputMode::Unescaped => L!("--tokenize"),
+    }
+}
 
 fn parse_cmd_opts(
     args: &mut [&wstr],
@@ -106,18 +113,11 @@ fn parse_cmd_opts(
             'd' => {
                 opts.delimiter = Some(w.woptarg.unwrap().to_owned());
             }
-            'i' => {
-                streams.err.append(wgettext_fmt!(
-                    "%ls: usage of -i for --silent is deprecated. Please use -s or --silent instead.\n",
-                    cmd
-                ));
-                return Err(STATUS_INVALID_ARGS);
-            }
             'f' => {
-                opts.place |= EnvMode::FUNCTION;
+                opts.place.mode |= EnvMode::FUNCTION;
             }
             'g' => {
-                opts.place |= EnvMode::GLOBAL;
+                opts.place.mode |= EnvMode::GLOBAL;
             }
             'h' => {
                 opts.print_help = true;
@@ -126,27 +126,23 @@ fn parse_cmd_opts(
                 opts.one_line = true;
             }
             'l' => {
-                opts.place |= EnvMode::LOCAL;
+                opts.place.mode |= EnvMode::LOCAL;
             }
             'n' => {
                 opts.nchars = match fish_wcstoi(w.woptarg.unwrap()) {
-                    Ok(n) if n >= 0 => n.try_into().unwrap(),
+                    Ok(n) if n >= 0 => NonZeroUsize::new(n.try_into().unwrap()),
                     Err(wutil::Error::Overflow) => {
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: Argument '%ls' is out of range\n",
-                            cmd,
-                            w.woptarg.unwrap()
-                        ));
-                        builtin_print_error_trailer(parser, streams.err, cmd);
+                        err_fmt!("Argument '%s' is out of range", w.woptarg.unwrap())
+                            .cmd(cmd)
+                            .full_trailer(parser)
+                            .finish(streams);
                         return Err(STATUS_INVALID_ARGS);
                     }
                     _ => {
-                        streams.err.append(wgettext_fmt!(
-                            BUILTIN_ERR_NOT_NUMBER,
-                            cmd,
-                            w.woptarg.unwrap()
-                        ));
-                        builtin_print_error_trailer(parser, streams.err, cmd);
+                        err_fmt!(Error::NOT_NUMBER, w.woptarg.unwrap())
+                            .cmd(cmd)
+                            .full_trailer(parser)
+                            .finish(streams);
                         return Err(STATUS_INVALID_ARGS);
                     }
                 }
@@ -166,23 +162,48 @@ fn parse_cmd_opts(
             'S' => {
                 opts.shell = true;
             }
-            't' => {
-                opts.tokenize = true;
+            't' | '\x01' => {
+                let new_mode = match opt {
+                    't' => TokenOutputMode::Unescaped,
+                    '\x01' => TokenOutputMode::Raw,
+                    _ => unreachable!(),
+                };
+                if let Some(old_mode) = opts.token_mode {
+                    if old_mode != new_mode {
+                        err_fmt!(
+                            Error::INVALID_OPT_COMBO_WITH_CTX,
+                            wgettext_fmt!(
+                                "%s and %s are mutually exclusive",
+                                tokenize_flag(old_mode),
+                                tokenize_flag(new_mode),
+                            )
+                        )
+                        .cmd(cmd)
+                        .full_trailer(parser)
+                        .finish(streams);
+                        return Err(STATUS_INVALID_ARGS);
+                    }
+                }
+                opts.token_mode = Some(new_mode);
             }
             'U' => {
-                opts.place |= EnvMode::UNIVERSAL;
+                opts.place.mode |= EnvMode::UNIVERSAL;
             }
             'u' => {
-                opts.place |= EnvMode::UNEXPORT;
+                opts.place.mode |= EnvMode::UNEXPORT;
             }
             'x' => {
-                opts.place |= EnvMode::EXPORT;
+                opts.place.mode |= EnvMode::EXPORT;
             }
             'z' => {
                 opts.split_null = true;
             }
             ':' => {
-                builtin_missing_argument(parser, streams, cmd, args[w.wopt_index - 1], true);
+                builtin_missing_argument(parser, streams, cmd, None, args[w.wopt_index - 1], true);
+                return Err(STATUS_INVALID_ARGS);
+            }
+            ';' => {
+                builtin_unexpected_argument(parser, streams, cmd, args[w.wopt_index - 1], true);
                 return Err(STATUS_INVALID_ARGS);
             }
             '?' => {
@@ -200,40 +221,52 @@ fn parse_cmd_opts(
 
 /// Read from the tty. This is only valid when the stream is stdin and it is attached to a tty and
 /// we weren't asked to split on null characters.
+#[allow(clippy::too_many_arguments)]
 fn read_interactive(
-    parser: &Parser,
+    parser: &mut Parser,
     buff: &mut WString,
-    nchars: usize,
+    nchars: Option<NonZeroUsize>,
     shell: bool,
     silent: bool,
     prompt: &wstr,
+    prompt_str_is_empty: bool,
     right_prompt: &wstr,
-    commandline: &Option<WString>,
+    commandline: Option<&WString>,
     inputfd: RawFd,
 ) -> BuiltinResult {
     let mut exit_res = Ok(SUCCESS);
 
     // Construct a configuration.
-    let mut conf = ReaderConfig::default();
-    conf.complete_ok = shell;
-    conf.highlight_ok = shell;
-    conf.syntax_check_ok = shell;
+    let conf = ReaderConfig {
+        complete_ok: shell,
+        highlight_ok: shell,
+        syntax_check_ok: shell,
 
-    // No autosuggestions or abbreviations in builtin_read.
-    conf.autosuggest_ok = false;
-    conf.expand_abbrev_ok = false;
+        // No autosuggestions or abbreviations in builtin_read.
+        autosuggest_ok: false,
+        expand_abbrev_ok: false,
 
-    conf.exit_on_interrupt = true;
-    conf.in_silent_mode = silent;
+        exit_on_interrupt: true,
+        read_prompt_str_is_empty: prompt_str_is_empty,
+        in_silent_mode: silent,
 
-    conf.left_prompt_cmd = prompt.to_owned();
-    conf.right_prompt_cmd = right_prompt.to_owned();
-    conf.event = L!("fish_read");
+        left_prompt_cmd: prompt.to_owned(),
+        right_prompt_cmd: right_prompt.to_owned(),
+        event: L!("fish_read"),
 
-    conf.inputfd = inputfd;
+        inputfd,
+
+        ..Default::default()
+    };
+
+    let old_modes = set_shell_modes_temporarily(inputfd);
 
     // Keep in-memory history only.
-    reader_push(parser, L!(""), conf);
+    reader_push(
+        parser,
+        HistoryId::Memory(MemoryHistoryId::BuiltinRead),
+        conf,
+    );
     let _modifiable_commandline = parser.scope().readonly_commandline.then(|| {
         parser.push_scope(|s| {
             s.readonly_commandline = false;
@@ -245,18 +278,18 @@ fn read_interactive(
 
     let mline = {
         let _interactive = parser.push_scope(|s| s.is_interactive = true);
-        let mut scoped_handoff = TtyHandoff::new(reader_save_screen_state);
-        scoped_handoff.enable_tty_protocols();
-        reader_readline(parser, NonZeroUsize::try_from(nchars).ok())
+        reader_readline(parser, old_modes, nchars)
     };
     if let Some(line) = mline {
         *buff = line;
-        if nchars > 0 && nchars < buff.len() {
+        if let Some(nchars) = nchars.map(usize::from) {
             // Line may be longer than nchars if a keybinding used `commandline -i`
             // note: we're deliberately throwing away the tail of the commandline.
             // It shouldn't be unread because it was produced with `commandline -i`,
             // not typed.
-            buff.truncate(nchars);
+            if nchars < buff.len() {
+                buff.truncate(nchars);
+            }
         }
     } else {
         exit_res = Err(STATUS_CMD_ERROR);
@@ -323,7 +356,7 @@ fn read_in_chunks(fd: RawFd, buff: &mut WString, split_null: bool, do_seek: bool
         }
     }
 
-    *buff = str2wcstring(&narrow_buff);
+    *buff = bytes2wcstring(&narrow_buff);
     if buff.is_empty() && eof {
         exit_res = Err(STATUS_CMD_ERROR);
     }
@@ -337,7 +370,7 @@ fn read_in_chunks(fd: RawFd, buff: &mut WString, split_null: bool, do_seek: bool
 fn read_one_char_at_a_time(
     fd: RawFd,
     buff: &mut WString,
-    nchars: usize,
+    nchars: Option<NonZeroUsize>,
     split_null: bool,
 ) -> BuiltinResult {
     let mut exit_res = Ok(SUCCESS);
@@ -346,8 +379,6 @@ fn read_one_char_at_a_time(
     let mut unconsumed = vec![];
 
     loop {
-        let mut state = zero_mbstate();
-
         let chars_read = buff.len();
         let res = loop {
             let mut b = [0_u8; 1];
@@ -357,17 +388,9 @@ fn read_one_char_at_a_time(
                 }
                 _ => {}
             }
-            let b = b[0];
-            unconsumed.push(b);
+            unconsumed.push(b[0]);
             nbytes += 1;
-            let mut consumed = 0;
-            match decode_input_byte(
-                buff,
-                InvalidPolicy::Passthrough,
-                &mut state,
-                &unconsumed,
-                &mut consumed,
-            ) {
+            match decode_utf8(buff, InvalidPolicy::Passthrough, &unconsumed) {
                 DecodeState::Incomplete => continue,
                 DecodeState::Complete => {
                     unconsumed.clear();
@@ -394,8 +417,10 @@ fn read_one_char_at_a_time(
             buff.pop();
             break;
         }
-        if nchars > 0 && nchars <= buff.len() {
-            break;
+        if let Some(nchars) = nchars.map(usize::from) {
+            if nchars <= buff.len() {
+                break;
+            }
         }
     }
 
@@ -410,33 +435,28 @@ fn validate_read_args(
     parser: &Parser,
     streams: &mut IoStreams,
 ) -> BuiltinResult {
+    localizable_consts! {
+        OPTIONS_CANNOT_BE_COMBINED
+        "Options %s and %s cannot be used together"
+    }
     if opts.prompt.is_some() && opts.prompt_str.is_some() {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Options %ls and %ls cannot be used together\n",
-            cmd,
-            "-p",
-            "-P",
-        ));
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_fmt!(OPTIONS_CANNOT_BE_COMBINED, "-p", "-P")
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
     if opts.delimiter.is_some() && opts.one_line {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Options %ls and %ls cannot be used together\n",
-            cmd,
-            "--delimiter",
-            "--line"
-        ));
+        err_fmt!(OPTIONS_CANNOT_BE_COMBINED, "--delimiter", "--line")
+            .cmd(cmd)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
     if opts.one_line && opts.split_null {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Options %ls and %ls cannot be used together\n",
-            cmd,
-            "-z",
-            "--line"
-        ));
+        err_fmt!(OPTIONS_CANNOT_BE_COMBINED, "-z", "--line")
+            .cmd(cmd)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
@@ -446,82 +466,75 @@ fn validate_read_args(
         opts.prompt = Some(DEFAULT_READ_PROMPT.to_owned());
     }
 
-    if opts.place.contains(EnvMode::UNEXPORT) && opts.place.contains(EnvMode::EXPORT) {
-        streams.err.append(wgettext_fmt!(BUILTIN_ERR_EXPUNEXP, cmd));
-        builtin_print_error_trailer(parser, streams.err, cmd);
+    if opts.place.mode.contains(EnvMode::UNEXPORT) && opts.place.mode.contains(EnvMode::EXPORT) {
+        err_str!(Error::EXPORT_UNEXPORT)
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
     if opts
         .place
-        .intersection(EnvMode::LOCAL | EnvMode::FUNCTION | EnvMode::GLOBAL | EnvMode::UNIVERSAL)
+        .mode
+        .intersection(EnvMode::ANY_SCOPE)
         .iter()
         .count()
         > 1
     {
-        streams.err.append(wgettext_fmt!(BUILTIN_ERR_GLOCAL, cmd));
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_str!(Error::MULTIPLE_SCOPES)
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
-    let argc = argv.len();
-    if !opts.array && argc < 1 && !opts.to_stdout {
-        streams
-            .err
-            .append(wgettext_fmt!(BUILTIN_ERR_MIN_ARG_COUNT1, cmd, 1, argc));
+    if opts.array && argv.len() != 1 {
+        err_fmt!(Error::UNEXP_ARG_COUNT, 1, argv.len())
+            .cmd(cmd)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
-    if opts.array && argc != 1 {
-        streams
-            .err
-            .append(wgettext_fmt!(BUILTIN_ERR_ARG_COUNT1, cmd, 1, argc));
-        return Err(STATUS_INVALID_ARGS);
+    fn tokenize_flag(token_mode: TokenOutputMode) -> &'static wstr {
+        match token_mode {
+            TokenOutputMode::Expanded => panic!(),
+            TokenOutputMode::Raw => L!("--tokenize-raw"),
+            TokenOutputMode::Unescaped => L!("--tokenize"),
+        }
     }
 
-    if opts.to_stdout && argc > 0 {
-        streams
-            .err
-            .append(wgettext_fmt!(BUILTIN_ERR_MAX_ARG_COUNT1, cmd, 0, argc));
-        return Err(STATUS_INVALID_ARGS);
-    }
+    if let Some(token_mode) = opts.token_mode {
+        if opts.delimiter.is_some() {
+            err_fmt!(
+                Error::COMBO_EXCLUSIVE,
+                "--delimiter",
+                tokenize_flag(token_mode)
+            )
+            .cmd(cmd)
+            .finish(streams);
+            return Err(STATUS_INVALID_ARGS);
+        }
 
-    if opts.tokenize && opts.delimiter.is_some() {
-        streams.err.append(wgettext_fmt!(
-            BUILTIN_ERR_COMBO2_EXCLUSIVE,
-            cmd,
-            "--delimiter",
-            "--tokenize"
-        ));
-        return Err(STATUS_INVALID_ARGS);
-    }
-
-    if opts.tokenize && opts.one_line {
-        streams.err.append(wgettext_fmt!(
-            BUILTIN_ERR_COMBO2_EXCLUSIVE,
-            cmd,
-            "--line",
-            "--tokenize"
-        ));
-        return Err(STATUS_INVALID_ARGS);
+        if opts.one_line {
+            err_fmt!(Error::COMBO_EXCLUSIVE, "--line", tokenize_flag(token_mode))
+                .cmd(cmd)
+                .finish(streams);
+            return Err(STATUS_INVALID_ARGS);
+        }
     }
 
     // Verify all variable names.
     for arg in argv {
         if !valid_var_name(arg) {
-            streams
-                .err
-                .append(wgettext_fmt!(BUILTIN_ERR_VARNAME, cmd, arg));
-            builtin_print_error_trailer(parser, streams.err, cmd);
+            varname_error(cmd, arg).full_trailer(parser).finish(streams);
             return Err(STATUS_INVALID_ARGS);
         }
         if EnvVar::flags_for(arg).contains(EnvVarFlags::READ_ONLY) {
-            streams.err.append(wgettext_fmt!(
-                "%ls: %ls: cannot overwrite read-only variable",
-                cmd,
-                arg
-            ));
-            builtin_print_error_trailer(parser, streams.err, cmd);
+            err_fmt!("%s: cannot overwrite read-only variable", arg)
+                .cmd(cmd)
+                .full_trailer(parser)
+                .finish(streams);
             return Err(STATUS_INVALID_ARGS);
         }
     }
@@ -530,22 +543,15 @@ fn validate_read_args(
 }
 
 /// The read builtin. Reads from stdin and stores the values in environment variables.
-pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> BuiltinResult {
+pub fn read(parser: &mut Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> BuiltinResult {
     let mut buff = WString::new();
     let mut exit_res: BuiltinResult;
 
     let (mut opts, optind) = parse_cmd_opts(argv, parser, streams)?;
 
     let cmd = argv[0];
-    let mut argv: &[&wstr] = argv;
-    if !opts.to_stdout {
-        argv = &argv[optind..];
-    }
+    let argv = &argv[optind..];
     let argc = argv.len();
-
-    if argv.is_empty() {
-        opts.to_stdout = true;
-    }
 
     if opts.print_help {
         builtin_print_help(parser, streams, cmd);
@@ -555,10 +561,8 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
     validate_read_args(cmd, &mut opts, argv, parser, streams)?;
 
     // stdin may have been explicitly closed
-    if streams.stdin_fd < 0 {
-        streams
-            .err
-            .append(wgettext_fmt!("%ls: stdin is closed\n", cmd));
+    if streams.is_stdin_closed() {
+        err_str!(Error::STDIN_CLOSED).cmd(cmd).finish(streams);
         return Err(STATUS_CMD_ERROR);
     }
 
@@ -571,14 +575,14 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
 
     let mut var_ptr = 0;
     let vars_left = |var_ptr: usize| argc - var_ptr;
-    let clear_remaining_vars = |var_ptr: &mut usize| {
+    let clear_remaining_vars = |parser: &mut Parser, var_ptr: &mut usize| {
         while vars_left(*var_ptr) != 0 {
-            parser.vars().set_empty(argv[*var_ptr], opts.place);
+            parser.set_empty(argv[*var_ptr], opts.place);
             *var_ptr += 1;
         }
     };
 
-    let stream_stdin_is_a_tty = isatty(streams.stdin_fd);
+    let stream_stdin_is_a_tty = streams.stdin_fd() >= 0 && isatty(streams.stdin_fd());
 
     // Normally, we either consume a line of input or all available input. But if we are reading a
     // line at a time, we need a middle ground where we only consume as many lines as we need to
@@ -595,18 +599,18 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
                 opts.shell,
                 opts.silent,
                 opts.prompt.as_ref().unwrap(),
+                opts.prompt_str.as_ref().is_some_and(|ps| ps.is_empty()),
                 &opts.right_prompt,
-                &opts.commandline,
-                streams.stdin_fd,
+                opts.commandline.as_ref(),
+                streams.stdin_fd(),
             );
-        } else if opts.nchars == 0 && !stream_stdin_is_a_tty &&
-                   // "one_line" is implemented as reading n-times to a new line,
-                   // if we're chunking we could get multiple lines so we would have to advance
-                   // more than 1 per run through the loop. Let's skip that for now.
-                   !opts.one_line &&
-                       (
-                           streams.stdin_is_directly_redirected ||
-                               unsafe {libc::lseek(streams.stdin_fd, 0, SEEK_CUR)} != -1)
+        } else if opts.nchars.is_none() && !stream_stdin_is_a_tty &&
+            // "one_line" is implemented as reading n-times to a new line,
+            // if we're chunking we could get multiple lines so we would have to advance
+            // more than 1 per run through the loop. Let's skip that for now.
+            !opts.one_line &&
+            (streams.stdin_is_directly_redirected ||
+                    unsafe {libc::lseek(streams.stdin_fd(), 0, SEEK_CUR)} != -1)
         {
             // We read in chunks when we either can seek (so we put the bytes back),
             // or we have the bytes to ourselves (because it's directly redirected).
@@ -616,38 +620,52 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
             // You don't rewind VHS tapes before throwing them in the trash.
             // TODO: Do this when nchars is set by seeking back.
             exit_res = read_in_chunks(
-                streams.stdin_fd,
+                streams.stdin_fd(),
                 &mut buff,
                 opts.split_null,
                 !streams.stdin_is_directly_redirected,
             );
         } else {
-            exit_res =
-                read_one_char_at_a_time(streams.stdin_fd, &mut buff, opts.nchars, opts.split_null);
+            exit_res = read_one_char_at_a_time(
+                streams.stdin_fd(),
+                &mut buff,
+                opts.nchars,
+                opts.split_null,
+            );
         }
 
         if exit_res.is_err() {
-            clear_remaining_vars(&mut var_ptr);
+            clear_remaining_vars(parser, &mut var_ptr);
             return exit_res;
         }
 
-        if opts.to_stdout {
-            streams.out.append(buff);
+        if argv.is_empty() {
+            streams.out.append(&buff);
             return exit_res;
         }
 
-        if opts.tokenize {
+        if let Some(token_mode) = opts.token_mode {
             let mut tok = Tokenizer::new(&buff, TOK_ACCEPT_UNFINISHED | TOK_ARGUMENT_LIST);
+            let token_text = |tokenizer: &mut Tokenizer<'_>, token: &Tok| -> WString {
+                let mut text = Cow::Borrowed(tokenizer.text_of(token));
+                match token_mode {
+                    TokenOutputMode::Expanded => panic!(),
+                    TokenOutputMode::Raw => (),
+                    TokenOutputMode::Unescaped => {
+                        if let Some(unescaped) =
+                            unescape_string(&text, UnescapeStringStyle::default())
+                        {
+                            text = Cow::Owned(unescaped);
+                        }
+                    }
+                }
+                text.into_owned()
+            };
             if opts.array {
                 // Array mode: assign each token as a separate element of the sole var.
                 let mut tokens = vec![];
                 while let Some(t) = tok.next() {
-                    let text = tok.text_of(&t);
-                    if let Some(out) = unescape_string(text, UnescapeStringStyle::default()) {
-                        tokens.push(out);
-                    } else {
-                        tokens.push(text.to_owned());
-                    }
+                    tokens.push(token_text(&mut tok, &t));
                 }
 
                 parser.set_var_and_fire(argv[var_ptr], opts.place, tokens);
@@ -657,9 +675,7 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
                     let Some(t) = tok.next() else {
                         break;
                     };
-                    let text = tok.text_of(&t);
-                    let out = unescape_string(text, UnescapeStringStyle::default())
-                        .unwrap_or_else(|| text.to_owned());
+                    let out = token_text(&mut tok, &t);
                     parser.set_var_and_fire(argv[var_ptr], opts.place, vec![out]);
                     var_ptr += 1;
                 }
@@ -784,7 +800,7 @@ pub fn read(parser: &Parser, streams: &mut IoStreams, argv: &mut [&wstr]) -> Bui
 
     if !opts.array {
         // In case there were more args than splits
-        clear_remaining_vars(&mut var_ptr);
+        clear_remaining_vars(parser, &mut var_ptr);
     }
 
     exit_res

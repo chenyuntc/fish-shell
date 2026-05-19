@@ -4,7 +4,7 @@
 # Ensure job control works in non-interactive environments.
 
 status job-control full
-/bin/echo hello
+command echo hello
 #CHECK: hello
 
 $fth print_pgrp | read first
@@ -19,3 +19,6 @@ or echo "pgroups were the same, job control did not work"
 $fish -c 'status job-control full ; $fth report_foreground' &
 wait
 #CHECKERR: background
+
+$fish -c 'sleep .2 & bg %1'
+#CHECKERR: bg: Can't put job 1, 'sleep .2 &' to background because it is not under job control

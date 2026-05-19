@@ -1,3 +1,5 @@
+# localization: skip(private)
+
 # Try to set the locale from the system configuration if we did not inherit any. One case where this
 # can happen is a linux with systemd where the user logs in via getty (e.g., on the system console).
 # See https://github.com/fish-shell/fish-shell/issues/3092. This isn't actually our job, so there's
@@ -9,10 +11,7 @@
 # LANG seems more likely to be caused by a missing or misconfigured locale configuration.
 
 function __fish_set_locale
-    set -l LOCALE_VARS
-    set -a LOCALE_VARS LANG LC_CTYPE LC_NUMERIC LC_TIME LC_COLLATE
-    set -a LOCALE_VARS LC_MONETARY LC_MESSAGES LC_PAPER LC_NAME LC_ADDRESS
-    set -a LOCALE_VARS LC_TELEPHONE LC_MEASUREMENT LC_IDENTIFICATION
+    set -l LOCALE_VARS (__fish_locale_vars)
 
     # We check LC_ALL to figure out if we have a locale but we don't set it later. That is because
     # locale.conf doesn't allow it so we should not set it.
@@ -67,12 +66,4 @@ function __fish_set_locale
             end <$f
         end
     end
-
-    # If we really cannot get anything, at least set character encoding to UTF-8.
-    for locale_var in $LOCALE_VARS LC_ALL
-        if set -q $locale_var
-            return 0
-        end
-    end
-    set -gx LC_CTYPE en_US.UTF-8
 end

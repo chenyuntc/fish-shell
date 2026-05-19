@@ -1,10 +1,10 @@
 use crate::signal::Signal;
-use crate::wchar::{wstr, WString, L};
-use crate::wcstringutil::join_strings;
 use bitflags::bitflags;
+use fish_common::assert_sorted_by_name;
+use fish_wcstringutil::join_strings;
+use fish_widestring::{L, WString, wstr};
 use libc::c_int;
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 /// The character used to delimit path and non-path variables in exporting and in string expansion.
@@ -32,12 +32,14 @@ bitflags! {
         const PATHVAR = 1 << 6;
         /// Flag to unmark a variable as a path variable.
         const UNPATHVAR = 1 << 7;
-        /// Flag for variable update request from the user. All variable changes that are made directly
-        /// by the user, such as those from the `read` and `set` builtin must have this flag set. It
-        /// serves one purpose: to indicate that an error should be returned if the user is attempting
-        /// to modify a var that should not be modified by direct user action; e.g., a read-only var.
-        const USER = 1 << 8;
     }
+}
+
+impl EnvMode {
+    pub const ANY_SCOPE: EnvMode = EnvMode::LOCAL
+        .union(EnvMode::FUNCTION)
+        .union(EnvMode::GLOBAL)
+        .union(EnvMode::UNIVERSAL);
 }
 
 impl From<EnvMode> for u16 {
@@ -46,15 +48,33 @@ impl From<EnvMode> for u16 {
     }
 }
 
-/// A struct of configuration directories, determined in main() that fish will optionally pass to
-/// env_init.
-#[derive(Default)]
-pub struct ConfigPaths {
-    pub data: Option<PathBuf>,   // e.g., /usr/local/share
-    pub sysconf: PathBuf,        // e.g., /usr/local/etc
-    pub doc: PathBuf,            // e.g., /usr/local/share/doc/fish
-    pub bin: Option<PathBuf>,    // e.g., /usr/local/bin
-    pub locale: Option<PathBuf>, // e.g., /usr/local/share/locale
+#[derive(Copy, Clone, Default)]
+pub struct EnvSetMode {
+    pub mode: EnvMode,
+
+    /// Flag for variable update request from the user. All variable changes that are made directly
+    /// by the user, such as those from the `read` and `set` builtin must have this flag set. It
+    /// serves to indicate that an error should be returned if the user is attempting to modify
+    /// a var that should not be modified by direct user action; e.g., a read-only var.
+    pub user: bool,
+
+    pub is_repainting: bool,
+}
+
+impl EnvSetMode {
+    pub fn new(mode: EnvMode, is_repainting: bool) -> Self {
+        Self::new_with(mode, false, is_repainting)
+    }
+    pub fn new_with(mode: EnvMode, user: bool, is_repainting: bool) -> Self {
+        Self {
+            mode,
+            user,
+            is_repainting,
+        }
+    }
+    pub fn new_at_early_startup(mode: EnvMode) -> Self {
+        Self::new_with(mode, false, false)
+    }
 }
 
 /// A collection of status and pipestatus.
@@ -110,13 +130,12 @@ pub struct EnvVar {
 
 impl Default for EnvVar {
     fn default() -> Self {
-        use std::sync::OnceLock;
+        use std::sync::LazyLock;
         /// A shared read-only empty list.
-        static EMPTY_LIST: OnceLock<Arc<[WString]>> = OnceLock::new();
-        let empty_list = EMPTY_LIST.get_or_init(|| Arc::new([]));
+        static EMPTY_LIST: LazyLock<Arc<[WString]>> = LazyLock::new(|| Arc::new([]));
 
         EnvVar {
-            values: Arc::clone(empty_list),
+            values: Arc::clone(&*EMPTY_LIST),
             flags: EnvVarFlags::empty(),
         }
     }
@@ -167,22 +186,13 @@ impl EnvVar {
     }
 
     /// Returns the variable's flags.
-    pub fn get_flags(&self) -> EnvVarFlags {
+    pub fn flags(&self) -> EnvVarFlags {
         self.flags
     }
 
     /// Returns the variable's value as a string.
     pub fn as_string(&self) -> WString {
-        join_strings(&self.values, self.get_delimiter())
-    }
-
-    /// Copies the variable's values into an existing list, avoiding reallocation if possible.
-    pub fn to_list(&self, out: &mut Vec<WString>) {
-        // Try to avoid reallocation as much as possible.
-        out.resize(self.values.len(), WString::new());
-        for (i, val) in self.values.iter().enumerate() {
-            out[i].clone_from(val);
-        }
+        join_strings(&self.values, self.delimiter())
     }
 
     /// Returns the variable's values.
@@ -191,7 +201,7 @@ impl EnvVar {
     }
 
     /// Returns the delimiter character used when converting from a list to a string.
-    pub fn get_delimiter(&self) -> char {
+    pub fn delimiter(&self) -> char {
         if self.is_pathvar() {
             PATH_ARRAY_SEP
         } else {
@@ -251,6 +261,8 @@ pub struct ElectricVar {
     flags: electric::ElectricVarFlags,
 }
 
+pub const FISH_TERMINAL_COLOR_THEME_VAR: &wstr = L!("fish_terminal_color_theme");
+
 // Keep sorted alphabetically
 #[rustfmt::skip]
 pub const ELECTRIC_VARIABLES: &[ElectricVar] = &[
@@ -261,6 +273,7 @@ pub const ELECTRIC_VARIABLES: &[ElectricVar] = &[
     ElectricVar{name: L!("fish_kill_signal"), flags:electric::READONLY | electric::COMPUTED},
     ElectricVar{name: L!("fish_killring"), flags:electric::READONLY | electric::COMPUTED},
     ElectricVar{name: L!("fish_pid"), flags:electric::READONLY},
+    ElectricVar{name: FISH_TERMINAL_COLOR_THEME_VAR, flags:electric::READONLY},
     ElectricVar{name: L!("history"), flags:electric::READONLY | electric::COMPUTED},
     ElectricVar{name: L!("hostname"), flags:electric::READONLY},
     ElectricVar{name: L!("pipestatus"), flags:electric::READONLY | electric::COMPUTED},
@@ -299,5 +312,75 @@ pub fn is_read_only(name: &wstr) -> bool {
         ev.flags & electric::READONLY != 0
     } else {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EnvMode, EnvVar, EnvVarFlags};
+    use crate::env::EnvSetMode;
+    use crate::env::environment::{EnvStack, Environment as _};
+    use crate::prelude::*;
+    use crate::tests::prelude::*;
+    use assert_matches::assert_matches;
+    use std::{
+        mem::MaybeUninit,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    /// Helper for test_timezone_env_vars().
+    fn return_timezone_hour(tstamp: SystemTime, timezone: &wstr) -> libc::c_int {
+        let vars = EnvStack::globals().create_child(true /* dispatches_var_changes */);
+
+        vars.set_one(
+            L!("TZ"),
+            EnvSetMode::new(EnvMode::EXPORT, false),
+            timezone.to_owned(),
+        );
+
+        let _var = vars.get(L!("TZ"));
+
+        #[allow(deprecated)]
+        let tstamp: libc::time_t = tstamp
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            .try_into()
+            .unwrap();
+        let mut local_time = MaybeUninit::uninit();
+        unsafe { libc::localtime_r(&tstamp, local_time.as_mut_ptr()) };
+        let local_time = unsafe { local_time.assume_init() };
+        local_time.tm_hour
+    }
+
+    /// Verify that setting TZ calls tzset() in the current shell process.
+    fn test_timezone_env_vars() {
+        // Confirm changing the timezone affects fish's idea of the local time.
+        let tstamp = SystemTime::now();
+
+        let first_tstamp = return_timezone_hour(tstamp, L!("UTC-1"));
+        let second_tstamp = return_timezone_hour(tstamp, L!("UTC-2"));
+        let delta = second_tstamp - first_tstamp;
+        assert_matches!(delta, 1 | -23);
+    }
+
+    // Verify that setting special env vars have the expected effect on the current shell process.
+    #[test]
+    #[serial]
+    fn test_env_vars() {
+        test_init();
+        test_timezone_env_vars();
+        // TODO: Add tests for the locale vars.
+
+        let v1 = EnvVar::new(L!("abc").to_owned(), EnvVarFlags::EXPORT);
+        let v2 = EnvVar::new_vec(vec![L!("abc").to_owned()], EnvVarFlags::EXPORT);
+        let v3 = EnvVar::new_vec(vec![L!("abc").to_owned()], EnvVarFlags::empty());
+        let v4 = EnvVar::new_vec(
+            vec![L!("abc").to_owned(), L!("def").to_owned()],
+            EnvVarFlags::EXPORT,
+        );
+        assert_eq!(v1, v2);
+        assert_ne!(v1, v3);
+        assert_ne!(v1, v4);
     }
 }

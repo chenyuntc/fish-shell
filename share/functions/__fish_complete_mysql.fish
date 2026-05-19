@@ -1,5 +1,6 @@
+# localization: tier3
 function __fish_mysql_query -a query
-    argparse -i 'u/user=' 'P/port=' 'h/host=' 'p/password=?' 'S/socket=' -- (commandline -px)
+    argparse -u 'u/user=' 'P/port=' 'h/host=' 'p/password=?' 'S/socket=' -- (commandline -px)
     set -l mysql_cmd mysql
     for flag in u P h S
         if set -q _flag_$flag

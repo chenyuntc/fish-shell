@@ -1,28 +1,31 @@
-use crate::common::{
-    fish_reserved_codepoint, is_windows_subsystem_for_linux, read_blocked, shell_modes,
-    str2wcstring, WSL,
+use crate::{
+    common::{WSL, is_windows_subsystem_for_linux, shell_modes},
+    env::{EnvStack, Environment as _},
+    fd_readable_set::{FdReadableSet, Timeout},
+    flog::{FloggableDebug, FloggableDisplay, flog},
+    key::{
+        self, Key, Modifiers, ViewportPosition, alt, canonicalize_control_char,
+        canonicalize_keyed_control_char, char_to_symbol, function_key, shift,
+    },
+    prelude::*,
+    reader::reader_test_and_clear_interrupted,
+    tty_handoff::{
+        SCROLL_CONTENT_UP_TERMINFO_CODE, TERMINAL_OS_NAME, XTGETTCAP_QUERY_OS_NAME, XTVERSION,
+        maybe_set_kitty_keyboard_capability, maybe_set_scroll_content_up_capability,
+    },
+    universal_notifier::default_notifier,
+    wutil::{fish_is_pua, fish_wcstol},
 };
-use crate::env::{EnvStack, Environment};
-use crate::fd_readable_set::{FdReadableSet, Timeout};
-use crate::flog::{FloggableDebug, FloggableDisplay, FLOG};
-use crate::key::{
-    self, alt, canonicalize_control_char, canonicalize_keyed_control_char, char_to_symbol,
-    function_key, shift, Key, Modifiers, ViewportPosition,
+use fish_common::read_blocked;
+use fish_feature_flags::{FeatureFlag, feature_test};
+use fish_widestring::{bytes2wcstring, encode_byte_to_char, fish_reserved_codepoint};
+use nix::sys::{select::FdSet, signal::SigSet, time::TimeSpec};
+use std::{
+    collections::VecDeque,
+    os::fd::{BorrowedFd, RawFd},
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
 };
-use crate::reader::{reader_save_screen_state, reader_test_and_clear_interrupted};
-use crate::terminal::{Capability, SCROLL_FORWARD_SUPPORTED, SCROLL_FORWARD_TERMINFO_CODE};
-use crate::threads::iothread_port;
-use crate::tty_handoff::{get_kitty_keyboard_capability, set_kitty_keyboard_capability};
-use crate::universal_notifier::default_notifier;
-use crate::wchar::{encode_byte_to_char, prelude::*};
-use crate::wutil::encoding::{mbrtowc, mbstate_t, zero_mbstate};
-use crate::wutil::fish_wcstol;
-use std::cell::{RefCell, RefMut};
-use std::collections::VecDeque;
-use std::mem::MaybeUninit;
-use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
 
 // The range of key codes for inputrc-style keyboard functions.
 pub const R_END_INPUT_FUNCTIONS: usize = (ReadlineCmd::ReverseRepeatJump as usize) + 1;
@@ -48,13 +51,21 @@ pub enum ReadlineCmd {
     BackwardCharPassive,
     ForwardSingleChar,
     ForwardCharPassive,
-    ForwardWord,
     BackwardWord,
-    ForwardBigword,
+    ForwardWordEmacs,
+    ForwardBigwordEmacs,
     BackwardBigword,
+    ForwardWordEnd,
+    BackwardWordEnd,
+    ForwardBigwordEnd,
+    BackwardBigwordEnd,
+    ForwardWordVi,
+    ForwardBigwordVi,
+    ForwardPathComponent,
     ForwardToken,
+    BackwardPathComponent,
     BackwardToken,
-    NextdOrForwardWord,
+    NextdOrForwardWordEmacs,
     PrevdOrBackwardWord,
     HistoryDelete,
     HistorySearchBackward,
@@ -77,8 +88,15 @@ pub enum ReadlineCmd {
     BackwardKillLine,
     KillWholeLine,
     KillInnerLine,
-    KillWord,
-    KillBigword,
+    KillWordEmacs,
+    KillBigwordEmacs,
+    KillWordVi,
+    KillBigwordVi,
+    KillInnerWord,
+    KillInnerBigWord,
+    KillAWord,
+    KillABigWord,
+    KillPathComponent,
     KillToken,
     BackwardKillWord,
     BackwardKillPathComponent,
@@ -90,6 +108,7 @@ pub enum ReadlineCmd {
     HistoryLastTokenSearchForward,
     SelfInsert,
     SelfInsertNotFirst,
+    GetKey,
     TransposeChars,
     TransposeWords,
     UpcaseWord,
@@ -170,6 +189,31 @@ impl KeyEvent {
     pub fn from_single_byte(c: u8) -> Self {
         Self::from(Key::from_single_byte(c))
     }
+
+    pub(crate) fn codepoint_text(&self) -> Option<char> {
+        let mut modifiers = self.modifiers;
+        let mut c = self.codepoint;
+        if self.shifted_codepoint != '\0' && modifiers.shift {
+            modifiers.shift = false;
+            c = self.shifted_codepoint;
+        }
+        if modifiers.is_some() {
+            return None;
+        }
+        if c == key::SPACE {
+            return Some(' ');
+        }
+        if c == key::ENTER {
+            return Some('\n');
+        }
+        if c == key::TAB {
+            return Some('\t');
+        }
+        if fish_is_pua(c) || u32::from(c) <= 27 {
+            return None;
+        }
+        Some(c)
+    }
 }
 
 impl From<Key> for KeyEvent {
@@ -205,14 +249,13 @@ fn apply_shift(mut key: Key, do_ascii: bool, shifted_codepoint: char) -> Option<
         key.codepoint = key.codepoint.to_ascii_uppercase();
     } else {
         return None;
-    };
+    }
     key.modifiers.shift = false;
     Some(key)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum KeyMatchQuality {
-    Legacy,
     BaseLayoutModuloShift,
     BaseLayout,
     ModuloShift,
@@ -245,88 +288,6 @@ pub(crate) fn match_key_event_to_key(event: &KeyEvent, key: &Key) -> Option<KeyM
     }
 
     None
-}
-
-#[test]
-fn test_match_key_event_to_key() {
-    macro_rules! validate {
-        ($evt:expr, $key:expr, $expected:expr) => {
-            assert_eq!(match_key_event_to_key(&$evt, &$key), $expected);
-        };
-    }
-
-    let none = Modifiers::default();
-    let shift = Modifiers::SHIFT;
-    let ctrl = Modifiers::CTRL;
-    let ctrl_shift = Modifiers {
-        ctrl: true,
-        shift: true,
-        ..Default::default()
-    };
-
-    let exact = KeyMatchQuality::Exact;
-    let modulo_shift = KeyMatchQuality::ModuloShift;
-    let base_layout = KeyMatchQuality::BaseLayout;
-    let base_layout_modulo_shift = KeyMatchQuality::BaseLayoutModuloShift;
-
-    validate!(KeyEvent::new(none, 'a'), Key::new(none, 'a'), Some(exact));
-    validate!(KeyEvent::new(none, 'a'), Key::new(none, 'A'), None);
-    validate!(KeyEvent::new(shift, 'a'), Key::new(shift, 'a'), Some(exact));
-    validate!(KeyEvent::new(shift, 'a'), Key::new(none, 'A'), None);
-    validate!(KeyEvent::new(shift, 'ä'), Key::new(none, 'Ä'), None);
-    // For historical reasons we canonicalize notation for ASCII keys like "shift-a" to "A",
-    // but not "shift-a" events - those should send a shifted key.
-    validate!(
-        KeyEvent::new(none, 'A'),
-        Key::new(shift, 'a'),
-        Some(modulo_shift)
-    );
-    validate!(KeyEvent::new(none, 'A'), Key::new(shift, 'A'), None);
-    validate!(KeyEvent::new(none, 'Ä'), Key::new(none, 'Ä'), Some(exact));
-    validate!(KeyEvent::new(none, 'Ä'), Key::new(shift, 'ä'), None);
-
-    // FYI: for codepoints that are not letters with uppercase/lowercase versions, we use
-    // the shifted key in the canonical notation, because the unshifted one may depend on the
-    // keyboard layout.
-    let ctrl_shift_equals = KeyEvent::new_with(ctrl_shift, '=', Some('+'), None);
-    validate!(ctrl_shift_equals, Key::new(ctrl_shift, '='), Some(exact));
-    validate!(ctrl_shift_equals, Key::new(ctrl, '+'), Some(modulo_shift)); // canonical notation
-    validate!(ctrl_shift_equals, Key::new(ctrl_shift, '+'), None);
-    validate!(ctrl_shift_equals, Key::new(ctrl, '='), None);
-
-    // A event like capslock-shift-ä may or may not include a shifted codepoint.
-    //
-    // Without a shifted codepoint, we cannot easily match ctrl-Ä.
-    let caps_ctrl_shift_ä = KeyEvent::new(ctrl_shift, 'ä');
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'ä'), Some(exact)); // canonical notation
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'ä'), None);
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'Ä'), None); // can't match without shifted key
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'Ä'), None);
-    // With a shifted codepoint, we can match the alternative notation too.
-    let caps_ctrl_shift_ä = KeyEvent::new_with(ctrl_shift, 'ä', Some('Ä'), None);
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'ä'), Some(exact)); // canonical notation
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'ä'), None);
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'Ä'), Some(modulo_shift)); // matched via shifted key
-    validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'Ä'), None);
-
-    let ctrl_ц = KeyEvent::new_with(ctrl, 'ц', None, Some('w'));
-    let ctrl_shift_ц = KeyEvent::new_with(ctrl_shift, 'ц', Some('Ц'), Some('w'));
-    validate!(ctrl_ц, Key::new(ctrl, 'ц'), Some(exact));
-    validate!(ctrl_ц, Key::new(ctrl, 'w'), Some(base_layout));
-    validate!(ctrl_ц, Key::new(ctrl_shift, 'ц'), None);
-    validate!(ctrl_ц, Key::new(ctrl_shift, 'w'), None);
-    validate!(
-        ctrl_shift_ц,
-        Key::new(ctrl, 'W'),
-        Some(base_layout_modulo_shift)
-    );
-    validate!(ctrl_shift_ц, Key::new(ctrl, 'w'), None);
-
-    // Note that "bind ctrl-Ц" will win over "bind ctrl-shift-w".
-    // This is because we consider shift transformation to be less magic than base-key
-    // transformation.
-    validate!(ctrl_shift_ц, Key::new(ctrl, 'Ц'), Some(modulo_shift));
-    validate!(ctrl_shift_ц, Key::new(ctrl_shift, 'w'), Some(base_layout));
 }
 
 /// Represents an event on the character input stream.
@@ -381,16 +342,27 @@ pub enum ImplicitEvent {
     FocusIn,
     /// Our terminal window lost focus.
     FocusOut,
-    /// Request to disable mouse tracking.
-    DisableMouseTracking,
     /// Mouse left click.
     MouseLeft(ViewportPosition),
+    /// Terminal color theme change (light/dark mode).
+    NewColorTheme,
+    /// Window height changed.
+    NewWindowHeight,
 }
 
 #[derive(Debug, Clone)]
-pub enum QueryResponseEvent {
+pub enum QueryResponse {
     PrimaryDeviceAttribute,
-    CursorPositionReport(ViewportPosition),
+    BackgroundColor(xterm_color::Color),
+    CursorPosition(ViewportPosition),
+}
+
+#[derive(Debug, Clone)]
+pub enum QueryResultEvent {
+    Response(QueryResponse),
+    Timeout,
+    /// Canceled with ctrl-c.
+    Interrupted,
 }
 
 #[derive(Debug, Clone)]
@@ -407,7 +379,7 @@ pub enum CharEvent {
     /// Any event that has no user-visible representation.
     Implicit(ImplicitEvent),
 
-    QueryResponse(QueryResponseEvent),
+    QueryResult(QueryResultEvent),
 }
 impl FloggableDebug for CharEvent {}
 
@@ -509,6 +481,9 @@ enum InputEventTrigger {
 
     // Our ioport reported a change, so service main thread requests.
     IOPortNotified,
+
+    // No file descriptor was ready within the query timeout.
+    TimeoutElapsed,
 }
 
 fn readb(in_fd: RawFd) -> Option<u8> {
@@ -519,30 +494,29 @@ fn readb(in_fd: RawFd) -> Option<u8> {
         return None;
     }
     let c = arr[0];
-    FLOG!(reader, "Read byte", char_to_symbol(char::from(c), true));
+    flog!(reader, "Read byte", char_to_symbol(char::from(c), true));
     // The common path is to return a u8.
     Some(c)
 }
 
-fn next_input_event(in_fd: RawFd) -> InputEventTrigger {
+fn next_input_event(in_fd: RawFd, ioport_fd: RawFd, timeout: Timeout) -> InputEventTrigger {
     let mut fdset = FdReadableSet::new();
     loop {
         fdset.clear();
         fdset.add(in_fd);
 
-        // Add the completion ioport.
-        let ioport_fd = iothread_port();
+        // Add the completion ioport (possibly -1 - a no-op).
         fdset.add(ioport_fd);
 
         // Get the uvar notifier fd (possibly none).
         let notifier = default_notifier();
         let notifier_fd = notifier.notification_fd();
-        if let Some(notifier_fd) = notifier.notification_fd() {
+        if let Some(notifier_fd) = notifier_fd {
             fdset.add(notifier_fd);
         }
 
         // Here's where we call select().
-        let select_res = fdset.check_readable(Timeout::Forever);
+        let select_res = fdset.check_readable(timeout);
         if select_res < 0 {
             let err = errno::errno().0;
             if err == libc::EINTR || err == libc::EAGAIN {
@@ -552,6 +526,10 @@ fn next_input_event(in_fd: RawFd) -> InputEventTrigger {
                 // Some fd was invalid, so probably the tty has been closed.
                 return InputEventTrigger::Eof;
             }
+        }
+        if select_res == 0 {
+            assert!(!matches!(timeout, Timeout::Forever));
+            return InputEventTrigger::TimeoutElapsed;
         }
 
         // select() did not return an error, so we may have a readable fd.
@@ -576,52 +554,34 @@ fn next_input_event(in_fd: RawFd) -> InputEventTrigger {
     }
 }
 
-pub fn check_fd_readable(in_fd: RawFd, timeout: Duration) -> bool {
-    use std::ptr;
+pub fn check_fd_readable(in_fd: BorrowedFd, timeout: Duration) -> bool {
     // We are not prepared to handle a signal immediately; we only want to know if we get input on
     // our fd before the timeout. Use pselect to block all signals; we will handle signals
     // before the next call to readch().
-    let mut sigs = MaybeUninit::uninit();
-    let mut sigs = unsafe {
-        libc::sigfillset(sigs.as_mut_ptr());
-        sigs.assume_init()
-    };
-
-    // pselect expects timeouts in nanoseconds.
-    const NSEC_PER_MSEC: u64 = 1000 * 1000;
-    const NSEC_PER_SEC: u64 = NSEC_PER_MSEC * 1000;
-    let wait_nsec: u64 = (timeout.as_millis() as u64) * NSEC_PER_MSEC;
-    let timeout = libc::timespec {
-        tv_sec: (wait_nsec / NSEC_PER_SEC).try_into().unwrap(),
-        tv_nsec: (wait_nsec % NSEC_PER_SEC).try_into().unwrap(),
-    };
 
     // We have one fd of interest.
-    let mut fdset = MaybeUninit::uninit();
-    let mut fdset = unsafe {
-        libc::FD_ZERO(fdset.as_mut_ptr());
-        fdset.assume_init()
+    let mut readfds = {
+        let mut set = FdSet::new();
+        set.insert(in_fd);
+        set
     };
-    unsafe {
-        libc::FD_SET(in_fd, &mut fdset);
-    }
 
-    let res = unsafe {
-        libc::pselect(
-            in_fd + 1,
-            &mut fdset,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            &timeout,
-            &sigs,
-        )
-    };
+    let res = nix::sys::select::pselect(
+        None,
+        &mut readfds,
+        None,
+        None,
+        &TimeSpec::from_duration(timeout),
+        &SigSet::all(),
+    )
+    .unwrap();
 
     // Prevent signal starvation on WSL causing the `torn_escapes.py` test to fail
     if is_windows_subsystem_for_linux(WSL::V1) {
         // Merely querying the current thread's sigmask is sufficient to deliver a pending signal
-        let _ = unsafe { libc::pthread_sigmask(0, ptr::null(), &mut sigs) };
+        _ = SigSet::thread_get_mask().expect("Failed to get sigmask!");
     }
+
     res > 0
 }
 
@@ -641,11 +601,11 @@ pub fn update_wait_on_escape_ms(vars: &EnvStack) {
         _ => {
             eprintf!(
                 concat!(
-                    "ignoring fish_escape_delay_ms: value '%ls' ",
+                    "ignoring fish_escape_delay_ms: value '%s' ",
                     "is not an integer or is < 10 or >= 5000 ms\n"
                 ),
                 fish_escape_delay_ms
-            )
+            );
         }
     }
 }
@@ -666,11 +626,11 @@ pub fn update_wait_on_sequence_key_ms(vars: &EnvStack) {
         _ => {
             eprintf!(
                 concat!(
-                    "ignoring fish_sequence_key_delay_ms: value '%ls' ",
+                    "ignoring fish_sequence_key_delay_ms: value '%s' ",
                     "is not an integer or is < 10 or >= 5000 ms\n"
                 ),
                 sequence_key_time_ms
-            )
+            );
         }
     }
 }
@@ -687,6 +647,7 @@ fn parse_mask(mask: u32) -> (Modifiers, bool) {
 }
 
 // A data type used by the input machinery.
+#[derive(Default)]
 pub struct InputData {
     // The file descriptor from which we read input, often stdin.
     pub in_fd: RawFd,
@@ -705,11 +666,17 @@ pub struct InputData {
 
     // Transient storage to avoid repeated allocations.
     pub event_storage: Vec<CharEvent>,
+
+    // How long to wait for responses for TTY queries.
+    pub blocking_query_timeout: Option<Duration>,
+
+    // If set, events will be buffered until the query finishes.
+    pub blocking_query: Option<TerminalQuery>,
 }
 
 impl InputData {
     /// Construct from the fd from which to read.
-    pub fn new(in_fd: RawFd) -> Self {
+    pub fn new(in_fd: RawFd, blocking_query_timeout: Option<Duration>) -> Self {
         Self {
             in_fd,
             queue: VecDeque::new(),
@@ -717,6 +684,8 @@ impl InputData {
             input_function_args: Vec::new(),
             function_status: false,
             event_storage: Vec::new(),
+            blocking_query_timeout,
+            blocking_query: None,
         }
     }
 
@@ -732,17 +701,45 @@ impl InputData {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub enum CursorPositionQuery {
-    MouseLeft(ViewportPosition),
-    ScrollbackPush,
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct BackgroundColorQuery {
+    pub result: Option<xterm_color::Color>,
 }
 
-#[derive(Eq, PartialEq)]
-pub enum TerminalQuery {
-    PrimaryDeviceAttribute,
-    CursorPositionReport(CursorPositionQuery),
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CursorPositionQueryReason {
+    NewPrompt,
+    WindowHeightChange,
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CursorPositionQuery {
+    pub reason: CursorPositionQueryReason,
+    pub result: Option<ViewportPosition>,
+}
+
+impl CursorPositionQuery {
+    pub fn new(reason: CursorPositionQueryReason) -> Self {
+        Self {
+            reason,
+            result: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct RecurrentQuery {
+    pub background_color: Option<BackgroundColorQuery>,
+    pub cursor_position: Option<CursorPositionQuery>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub enum TerminalQuery {
+    Initial,
+    Recurrent(RecurrentQuery),
+}
+
+pub const LONG_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A trait which knows how to produce a stream of input events.
 /// Note this is conceptually a "base class" with override points.
@@ -752,7 +749,7 @@ pub trait InputEventQueuer {
         if self.is_blocked_querying() {
             use ImplicitEvent::*;
             match self.get_input_data().queue.front()? {
-                CharEvent::QueryResponse(_) | CharEvent::Implicit(CheckExit | Eof) => {}
+                CharEvent::QueryResult(_) | CharEvent::Implicit(CheckExit | Eof) => {}
                 CharEvent::Key(_)
                 | CharEvent::Readline(_)
                 | CharEvent::Command(_)
@@ -764,9 +761,7 @@ pub trait InputEventQueuer {
         self.get_input_data_mut().queue.pop_front()
     }
 
-    /// Function used by [`readch`](Self::readch) to read bytes from stdin until enough bytes have been read to
-    /// convert them to a wchar_t. Conversion is done using mbrtowc. If a character has previously
-    /// been read and then 'unread' using \c input_common_unreadch, that character is returned.
+    /// Read the next event, such as a UTF-8-encoded codepoint.
     fn readch(&mut self) -> CharEvent {
         loop {
             // Do we have something enqueued already?
@@ -782,7 +777,15 @@ pub trait InputEventQueuer {
                 return mevt;
             }
 
-            match next_input_event(self.get_in_fd()) {
+            match next_input_event(
+                self.get_in_fd(),
+                self.get_ioport_fd(),
+                if self.is_blocked_querying() {
+                    Timeout::Duration(self.get_input_data().blocking_query_timeout.unwrap())
+                } else {
+                    Timeout::Forever
+                },
+            ) {
                 InputEventTrigger::Eof => {
                     return CharEvent::Implicit(ImplicitEvent::Eof);
                 }
@@ -802,7 +805,7 @@ pub trait InputEventQueuer {
                 InputEventTrigger::Byte(read_byte) => {
                     let mut have_escape_prefix = false;
                     let mut buffer = vec![read_byte];
-                    let key_with_escape = if read_byte == 0x1b {
+                    let mut key = if read_byte == 0x1b {
                         self.parse_escape_sequence(&mut buffer, &mut have_escape_prefix)
                     } else {
                         canonicalize_control_char(read_byte).map(KeyEvent::from)
@@ -814,45 +817,39 @@ pub trait InputEventQueuer {
                         continue;
                     }
                     let mut seq = WString::new();
-                    let mut key = key_with_escape;
-                    if key.is_some_and(|key| key.key == Key::from_raw(key::Invalid)) {
+                    if key.is_some_and(|key| key.key == Key::from_raw(key::INVALID)) {
                         continue;
                     }
-                    assert!(key.map_or(true, |key| key.codepoint != key::Invalid));
-                    let mut consumed = 0;
-                    let mut state = zero_mbstate();
-                    let mut i = 0;
+                    assert!(key.is_none_or(|key| key.codepoint != key::INVALID));
+                    // At this point, the bytes in `buffer` should be parsed as a UTF-8 sequence,
+                    // or, if they are not valid UTF-8, ignored. On incomplete sequences, another
+                    // byte is read and decoding is tried again in the next iteration.
                     let ok = loop {
-                        if i == buffer.len() {
-                            buffer.push(match next_input_event(self.get_in_fd()) {
-                                InputEventTrigger::Byte(b) => b,
-                                _ => 0,
-                            });
-                        }
-                        match decode_input_byte(
-                            &mut seq,
-                            InvalidPolicy::Error,
-                            &mut state,
-                            &buffer[..i + 1],
-                            &mut consumed,
-                        ) {
-                            DecodeState::Incomplete => (),
+                        match decode_utf8(&mut seq, InvalidPolicy::Error, &buffer) {
+                            DecodeState::Incomplete => {
+                                buffer.push(
+                                    match next_input_event(
+                                        self.get_in_fd(),
+                                        self.get_ioport_fd(),
+                                        Timeout::Forever,
+                                    ) {
+                                        InputEventTrigger::Byte(b) => b,
+                                        _ => 0,
+                                    },
+                                );
+                            }
                             DecodeState::Complete => {
-                                if have_escape_prefix && i != 0 {
-                                    have_escape_prefix = false;
+                                if have_escape_prefix {
                                     let c = seq.as_char_slice().last().unwrap();
                                     key = Some(KeyEvent::from(alt(*c)));
                                 }
-                                if i + 1 == buffer.len() {
-                                    break true;
-                                }
+                                break true;
                             }
                             DecodeState::Error => {
                                 self.push_front(CharEvent::from_check_exit());
                                 break false;
                             }
                         }
-                        i += 1;
                     };
                     if !ok {
                         continue;
@@ -869,7 +866,7 @@ pub trait InputEventQueuer {
                         )
                     };
                     if self.is_blocked_querying() {
-                        FLOG!(
+                        flog!(
                             reader,
                             "Still blocked on response from terminal, deferring key event",
                             key_evt
@@ -880,48 +877,67 @@ pub trait InputEventQueuer {
                                 self.push_back(evt);
                             }
                         });
-                        let vintr = shell_modes().c_cc[libc::VINTR];
+                        let vintr = shell_modes().control_chars[libc::VINTR];
                         if vintr != 0
                             && key.is_some_and(|key| {
                                 match_key_event_to_key(&key, &Key::from_single_byte(vintr))
                                     .is_some()
                             })
                         {
-                            FLOG!(
+                            flog!(
                                 reader,
                                 "Received interrupt key, giving up waiting for response from terminal"
                             );
-                            let ok = stop_query(self.blocking_query());
+                            let ok = stop_query(self.blocking_query_mut());
                             assert!(ok);
                             self.get_input_data_mut().queue.clear();
+                            self.push_front(CharEvent::QueryResult(QueryResultEvent::Interrupted));
                         }
                         continue;
                     }
                     extra.map(|extra| self.insert_front(extra));
                     return key_evt;
                 }
+                InputEventTrigger::TimeoutElapsed => {
+                    return CharEvent::QueryResult(QueryResultEvent::Timeout);
+                }
             }
         }
     }
 
-    fn try_readb(&mut self, buffer: &mut Vec<u8>) -> Option<u8> {
+    fn read_sequence_byte(&mut self, buffer: &mut Vec<u8>) -> Option<u8> {
         let fd = self.get_in_fd();
+        let strict = feature_test(FeatureFlag::OmitTermWorkarounds);
+        let historical_millis = |ms| {
+            if strict {
+                LONG_READ_TIMEOUT
+            } else {
+                Duration::from_millis(ms)
+            }
+        };
         if !check_fd_readable(
-            fd,
-            Duration::from_millis(
-                if self.paste_is_buffering()
-                    || get_kitty_keyboard_capability() == Capability::Supported
-                {
-                    300
-                } else {
-                    1
-                },
-            ),
+            unsafe { BorrowedFd::borrow_raw(fd) },
+            if self.paste_is_buffering() || self.is_blocked_querying() {
+                historical_millis(300)
+            } else if buffer == b"\x1b" {
+                Duration::from_millis(1) // distinguish legacy escape
+            } else {
+                historical_millis(30)
+            },
         ) {
-            FLOG!(
+            flog!(
                 reader,
                 format!("Incomplete escape sequence: {}", DisplayBytes(buffer))
             );
+            if buffer != b"\x1b" && strict {
+                flog!(
+                    error,
+                    format!(
+                        "Incomplete escape sequence seen (logging because omit-term-workarounds is on): {}",
+                        DisplayBytes(buffer)
+                    )
+                );
+            }
             return None;
         }
         let next = readb(fd)?;
@@ -936,16 +952,16 @@ pub trait InputEventQueuer {
     ) -> Option<KeyEvent> {
         assert!(buffer.len() <= 2);
         let recursive_invocation = buffer.len() == 2;
-        let Some(next) = self.try_readb(buffer) else {
-            return Some(KeyEvent::from_raw(key::Escape));
+        let Some(next) = self.read_sequence_byte(buffer) else {
+            return Some(KeyEvent::from_raw(key::ESCAPE));
         };
-        let invalid = KeyEvent::from_raw(key::Invalid);
+        let invalid = KeyEvent::from_raw(key::INVALID);
         if recursive_invocation && next == b'\x1b' {
             return Some(
                 match self.parse_escape_sequence(buffer, have_escape_prefix) {
                     Some(mut nested_sequence) => {
                         if nested_sequence.key == invalid.key {
-                            return Some(KeyEvent::from_raw(key::Escape));
+                            return Some(KeyEvent::from_raw(key::ESCAPE));
                         }
                         nested_sequence.modifiers.alt = true;
                         nested_sequence
@@ -962,9 +978,16 @@ pub trait InputEventQueuer {
             // potential SS3
             return Some(self.parse_ss3(buffer).unwrap_or(invalid));
         }
-        if !recursive_invocation && next == b'P' {
-            // potential DCS
-            return Some(self.parse_dcs(buffer).unwrap_or(invalid));
+        if !recursive_invocation {
+            if next == b']' {
+                // OSC
+                self.parse_osc(buffer);
+                return Some(invalid);
+            }
+            if next == b'P' {
+                // potential DCS
+                return Some(self.parse_dcs(buffer).unwrap_or(invalid));
+            }
         }
         match canonicalize_control_char(next) {
             Some(mut key) => {
@@ -981,10 +1004,10 @@ pub trait InputEventQueuer {
     fn parse_csi(&mut self, buffer: &mut Vec<u8>) -> Option<KeyEvent> {
         // The maximum number of CSI parameters is defined by NPAR, nominally 16.
         let mut params = [[0_u32; 4]; 16];
-        let Some(mut c) = self.try_readb(buffer) else {
+        let Some(mut c) = self.read_sequence_byte(buffer) else {
             return Some(KeyEvent::from(alt('[')));
         };
-        let mut next_char = |zelf: &mut Self| zelf.try_readb(buffer).unwrap_or(0xff);
+        let mut next_char = |zelf: &mut Self| zelf.read_sequence_byte(buffer).unwrap_or(0xff);
         let private_mode;
         if matches!(c, b'?' | b'<' | b'=' | b'>') {
             // private mode
@@ -1004,7 +1027,7 @@ pub trait InputEventQueuer {
                 {
                     Some(c) => params[count][subcount] = c,
                     None => return invalid_sequence(buffer),
-                };
+                }
             } else if c == b':' && subcount < 3 {
                 subcount += 1;
             } else if c == b';' {
@@ -1062,15 +1085,15 @@ pub trait InputEventQueuer {
                     _ => return None,
                 }
             }
-            b'A' => masked_key(key::Up),
-            b'B' => masked_key(key::Down),
-            b'C' => masked_key(key::Right),
-            b'D' => masked_key(key::Left),
+            b'A' => masked_key(key::UP),
+            b'B' => masked_key(key::DOWN),
+            b'C' => masked_key(key::RIGHT),
+            b'D' => masked_key(key::LEFT),
             b'E' => masked_key('5'),       // Numeric keypad
-            b'F' => masked_key(key::End),  // PC/xterm style
-            b'H' => masked_key(key::Home), // PC/xterm style
+            b'F' => masked_key(key::END),  // PC/xterm style
+            b'H' => masked_key(key::HOME), // PC/xterm style
             b'M' | b'm' => {
-                self.disable_mouse_tracking();
+                flog!(reader, "mouse event");
                 // Generic X10 or modified VT200 sequence, or extended (SGR/1006) mouse
                 // reporting mode, with semicolon-separated parameters for button code, Px,
                 // and Py, ending with 'M' for button press or 'm' for button release.
@@ -1110,14 +1133,14 @@ pub trait InputEventQueuer {
                 return None;
             }
             b't' => {
-                self.disable_mouse_tracking();
+                flog!(reader, "mouse event");
                 // VT200 button released in mouse highlighting mode at valid text location. 5 chars.
                 let _ = next_char(self);
                 let _ = next_char(self);
                 return None;
             }
             b'T' => {
-                self.disable_mouse_tracking();
+                flog!(reader, "mouse event");
                 // VT200 button released in mouse highlighting mode past end-of-line. 9 characters.
                 for _ in 0..6 {
                     let _ = next_char(self);
@@ -1139,23 +1162,21 @@ pub trait InputEventQueuer {
                 else {
                     return invalid_sequence(buffer);
                 };
-                FLOG!(reader, "Received cursor position report y:", y, "x:", x);
+                flog!(reader, "Received cursor position report y:", y, "x:", x);
                 let cursor_pos = ViewportPosition { x, y };
-                self.push_front(CharEvent::QueryResponse(
-                    QueryResponseEvent::CursorPositionReport(cursor_pos),
-                ));
+                self.push_query_response(QueryResponse::CursorPosition(cursor_pos));
                 return None;
             }
             b'S' => masked_key(function_key(4)),
             b'~' => match params[0][0] {
-                1 => masked_key(key::Home), // VT220/tmux style
-                2 => masked_key(key::Insert),
-                3 => masked_key(key::Delete),
-                4 => masked_key(key::End), // VT220/tmux style
-                5 => masked_key(key::PageUp),
-                6 => masked_key(key::PageDown),
-                7 => masked_key(key::Home), // rxvt style
-                8 => masked_key(key::End),  // rxvt style
+                1 => masked_key(key::HOME), // VT220/tmux style
+                2 => masked_key(key::INSERT),
+                3 => masked_key(key::DELETE),
+                4 => masked_key(key::END), // VT220/tmux style
+                5 => masked_key(key::PAGE_UP),
+                6 => masked_key(key::PAGE_DOWN),
+                7 => masked_key(key::HOME), // rxvt style
+                8 => masked_key(key::END),  // rxvt style
                 11..=15 => masked_key(
                     char::from_u32(u32::from(function_key(1)) + params[0][0] - 11).unwrap(),
                 ),
@@ -1194,25 +1215,29 @@ pub trait InputEventQueuer {
                 _ => return None,
             },
             b'c' if private_mode == Some(b'?') => {
-                self.push_front(CharEvent::QueryResponse(
-                    QueryResponseEvent::PrimaryDeviceAttribute,
-                ));
+                flog!(reader, "Received Primary Device Attribute response");
+                self.push_query_response(QueryResponse::PrimaryDeviceAttribute);
+                return None;
+            }
+            b'n' if private_mode == Some(b'?') && params[0] == [997, 0, 0, 0] => {
+                match params[1] {
+                    [1, 0, 0, 0] | [2, 0, 0, 0] => (),
+                    _ => return None,
+                }
+                flog!(reader, "Received color theme change");
+                self.push_front(CharEvent::Implicit(ImplicitEvent::NewColorTheme));
                 return None;
             }
             b'u' => {
                 if private_mode == Some(b'?') {
-                    FLOG!(
-                        reader,
-                        "Received kitty progressive enhancement flags, marking as supported"
-                    );
-                    set_kitty_keyboard_capability(reader_save_screen_state, Capability::Supported);
+                    maybe_set_kitty_keyboard_capability();
                     return None;
                 }
 
                 // Treat numpad keys the same as their non-numpad counterparts. Could add a numpad modifier here.
                 let key = match params[0][0] {
-                    57361 => key::PrintScreen,
-                    57363 => key::Menu,
+                    57361 => key::PRINT_SCREEN,
+                    57363 => key::MENU,
                     57399 => '0',
                     57400 => '1',
                     57401 => '2',
@@ -1228,18 +1253,18 @@ pub trait InputEventQueuer {
                     57411 => '*',
                     57412 => '-',
                     57413 => '+',
-                    57414 => key::Enter,
+                    57414 => key::ENTER,
                     57415 => '=',
-                    57417 => key::Left,
-                    57418 => key::Right,
-                    57419 => key::Up,
-                    57420 => key::Down,
-                    57421 => key::PageUp,
-                    57422 => key::PageDown,
-                    57423 => key::Home,
-                    57424 => key::End,
-                    57425 => key::Insert,
-                    57426 => key::Delete,
+                    57417 => key::LEFT,
+                    57418 => key::RIGHT,
+                    57419 => key::UP,
+                    57420 => key::DOWN,
+                    57421 => key::PAGE_UP,
+                    57422 => key::PAGE_DOWN,
+                    57423 => key::HOME,
+                    57424 => key::END,
+                    57425 => key::INSERT,
+                    57426 => key::DELETE,
                     cp => {
                         let Some(key) = char::from_u32(cp) else {
                             return invalid_sequence(buffer);
@@ -1259,7 +1284,7 @@ pub trait InputEventQueuer {
                     Some(base_layout_key),
                 )
             }
-            b'Z' => KeyEvent::from(shift(key::Tab)),
+            b'Z' => KeyEvent::from(shift(key::TAB)),
             b'I' => {
                 self.push_front(CharEvent::Implicit(ImplicitEvent::FocusIn));
                 return None;
@@ -1273,37 +1298,27 @@ pub trait InputEventQueuer {
         Some(key)
     }
 
-    fn disable_mouse_tracking(&mut self) {
-        // fish recognizes but does not actually support mouse reporting. We never turn it on, and
-        // it's only ever enabled if a program we spawned enabled it and crashed or forgot to turn
-        // it off before exiting. We turn it off here to avoid wasting resources.
-        FLOG!(reader, "Disabling mouse tracking");
-
-        // We shouldn't directly manipulate stdout from here, so we ask the reader to do it.
-        self.push_front(CharEvent::Implicit(ImplicitEvent::DisableMouseTracking));
-    }
-
     fn parse_ss3(&mut self, buffer: &mut Vec<u8>) -> Option<KeyEvent> {
         let mut raw_mask = 0;
-        let Some(mut code) = self.try_readb(buffer) else {
+        let Some(mut code) = self.read_sequence_byte(buffer) else {
             return Some(KeyEvent::from(alt('O')));
         };
-        while (b'0'..=b'9').contains(&code) {
+        while code.is_ascii_digit() {
             raw_mask = raw_mask * 10 + u32::from(code - b'0');
-            code = self.try_readb(buffer).unwrap_or(0xff);
+            code = self.read_sequence_byte(buffer).unwrap_or(0xff);
         }
         let (modifiers, _caps_lock) = parse_mask(raw_mask.saturating_sub(1));
         #[rustfmt::skip]
         let key = match code {
-            b' ' => KeyEvent::new(modifiers, key::Space),
-            b'A' => KeyEvent::new(modifiers, key::Up),
-            b'B' => KeyEvent::new(modifiers, key::Down),
-            b'C' => KeyEvent::new(modifiers, key::Right),
-            b'D' => KeyEvent::new(modifiers, key::Left),
-            b'F' => KeyEvent::new(modifiers, key::End),
-            b'H' => KeyEvent::new(modifiers, key::Home),
-            b'I' => KeyEvent::new(modifiers, key::Tab),
-            b'M' => KeyEvent::new(modifiers, key::Enter),
+            b' ' => KeyEvent::new(modifiers, key::SPACE),
+            b'A' => KeyEvent::new(modifiers, key::UP),
+            b'B' => KeyEvent::new(modifiers, key::DOWN),
+            b'C' => KeyEvent::new(modifiers, key::RIGHT),
+            b'D' => KeyEvent::new(modifiers, key::LEFT),
+            b'F' => KeyEvent::new(modifiers, key::END),
+            b'H' => KeyEvent::new(modifiers, key::HOME),
+            b'I' => KeyEvent::new(modifiers, key::TAB),
+            b'M' => KeyEvent::new(modifiers, key::ENTER),
             b'P' => KeyEvent::new(modifiers, function_key(1)),
             b'Q' => KeyEvent::new(modifiers, function_key(2)),
             b'R' => KeyEvent::new(modifiers, function_key(3)),
@@ -1330,39 +1345,59 @@ pub trait InputEventQueuer {
         Some(key)
     }
 
-    fn read_until_sequence_terminator(&mut self, buffer: &mut Vec<u8>) -> Option<()> {
+    fn read_until_sequence_terminator(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        allow_bel: bool,
+    ) -> Option<()> {
         let mut escape = false;
         loop {
-            let b = self.try_readb(buffer)?;
+            let b = self.read_sequence_byte(buffer)?;
+            if allow_bel && b == b'\x07' {
+                buffer.pop();
+                return Some(());
+            }
             if escape && b == b'\\' {
-                break;
+                buffer.pop();
+                buffer.pop();
+                return Some(());
             }
             escape = b == b'\x1b';
         }
-        buffer.pop();
-        buffer.pop();
-        Some(())
     }
 
     fn parse_xtversion(&mut self, buffer: &mut Vec<u8>) -> Option<()> {
         assert_eq!(buffer, b"\x1bP>");
-        self.read_until_sequence_terminator(buffer)?;
+        self.read_until_sequence_terminator(buffer, false)?;
         if buffer.get(3)? != &b'|' {
             return None;
         }
-        FLOG!(
-            reader,
-            format!(
-                "Received XTVERSION response: {}",
-                str2wcstring(&buffer[4..buffer.len()])
-            )
-        );
+        XTVERSION.get_or_init(|| {
+            let xtversion = bytes2wcstring(&buffer[4..buffer.len()]);
+            flog!(
+                reader,
+                format!("Received XTVERSION response: {}", xtversion)
+            );
+            xtversion
+        });
+        None
+    }
+
+    fn parse_osc(&mut self, buffer: &mut Vec<u8>) -> Option<()> {
+        let osc_prefix = b"\x1b]";
+        assert_eq!(buffer, osc_prefix);
+        self.read_until_sequence_terminator(buffer, /*allow_bel=*/ true)?;
+        let buffer = &buffer[osc_prefix.len()..];
+        let buffer = buffer.strip_prefix(b"11;")?;
+        let c = xterm_color::Color::parse(buffer).ok()?;
+        flog!(reader, format!("Received background color {c:?}"));
+        self.push_query_response(QueryResponse::BackgroundColor(c));
         None
     }
 
     fn parse_dcs(&mut self, buffer: &mut Vec<u8>) -> Option<KeyEvent> {
-        assert!(buffer.len() == 2);
-        let Some(success) = self.try_readb(buffer) else {
+        assert_eq!(buffer, b"\x1bP");
+        let Some(success) = self.read_sequence_byte(buffer) else {
             return Some(KeyEvent::from(alt('P')));
         };
         let success = match success {
@@ -1374,22 +1409,22 @@ pub trait InputEventQueuer {
             }
             _ => return None,
         };
-        if self.try_readb(buffer)? != b'+' {
+        if self.read_sequence_byte(buffer)? != b'+' {
             return None;
         }
-        if self.try_readb(buffer)? != b'r' {
+        if self.read_sequence_byte(buffer)? != b'r' {
             return None;
         }
-        self.read_until_sequence_terminator(buffer)?;
+        self.read_until_sequence_terminator(buffer, false)?;
         // \e P 1 r + Pn ST
         // \e P 0 r + msg ST
         let buffer = &buffer[5..];
         if !success {
-            FLOG!(
+            flog!(
                 reader,
                 format!(
                     "Received XTGETTCAP failure response: {}",
-                    str2wcstring(&parse_hex(buffer)?),
+                    bytes2wcstring(&parse_hex(buffer)?),
                 )
             );
             return None;
@@ -1397,27 +1432,32 @@ pub trait InputEventQueuer {
         let mut buffer = buffer.splitn(2, |&c| c == b'=');
         let key = buffer.next().unwrap();
         let key = parse_hex(key)?;
-        if let Some(value) = buffer.next() {
+        let value = if let Some(value) = buffer.next() {
             let value = parse_hex(value)?;
-            FLOG!(
+            flog!(
                 reader,
                 format!(
                     "Received XTGETTCAP response: {}={:?}",
-                    str2wcstring(&key),
-                    str2wcstring(&value)
+                    bytes2wcstring(&key),
+                    bytes2wcstring(&value)
                 )
             );
+            Some(value)
         } else {
-            FLOG!(
+            flog!(
                 reader,
-                format!("Received XTGETTCAP response: {}", str2wcstring(&key))
+                format!("Received XTGETTCAP response: {}", bytes2wcstring(&key))
             );
+            None
+        };
+        if key == SCROLL_CONTENT_UP_TERMINFO_CODE.as_bytes() {
+            maybe_set_scroll_content_up_capability();
+        } else if key == XTGETTCAP_QUERY_OS_NAME.as_bytes() {
+            if let Some(value) = value {
+                TERMINAL_OS_NAME.get_or_init(|| Some(bytes2wcstring(&value)));
+            }
         }
-        if key == SCROLL_FORWARD_TERMINFO_CODE.as_bytes() {
-            SCROLL_FORWARD_SUPPORTED.store(true);
-            FLOG!(reader, "Scroll forward is supported");
-        }
-        return None;
+        None
     }
 
     fn readch_timed_esc(&mut self) -> Option<CharEvent> {
@@ -1441,7 +1481,7 @@ pub trait InputEventQueuer {
         }
 
         check_fd_readable(
-            self.get_in_fd(),
+            unsafe { BorrowedFd::borrow_raw(self.get_in_fd()) },
             Duration::from_millis(u64::try_from(wait_time_ms).unwrap()),
         )
         .then(|| self.readch())
@@ -1450,6 +1490,11 @@ pub trait InputEventQueuer {
     /// Return the fd from which to read.
     fn get_in_fd(&self) -> RawFd {
         self.get_input_data().in_fd
+    }
+
+    /// Return the fd of the IO port, or -1 if none.
+    fn get_ioport_fd(&self) -> RawFd {
+        -1
     }
 
     /// Return the input data. This is to be implemented by the concrete type.
@@ -1483,7 +1528,7 @@ pub trait InputEventQueuer {
             .paste_buffer
             .as_mut()
             .unwrap()
-            .push(b)
+            .push(b);
     }
 
     fn paste_commit(&mut self) {
@@ -1500,6 +1545,10 @@ pub trait InputEventQueuer {
     /// will be the next character returned by readch.
     fn push_front(&mut self, ch: CharEvent) {
         self.get_input_data_mut().queue.push_front(ch);
+    }
+
+    fn push_query_response(&mut self, response: QueryResponse) {
+        self.push_front(CharEvent::QueryResult(QueryResultEvent::Response(response)));
     }
 
     /// Find the first sequence of non-char events, and promote them to the front.
@@ -1554,7 +1603,12 @@ pub trait InputEventQueuer {
         }
     }
 
-    fn blocking_query(&self) -> RefMut<'_, Option<TerminalQuery>>;
+    fn blocking_query(&self) -> &Option<TerminalQuery> {
+        &self.get_input_data().blocking_query
+    }
+    fn blocking_query_mut(&mut self) -> &mut Option<TerminalQuery> {
+        &mut self.get_input_data_mut().blocking_query
+    }
     fn is_blocked_querying(&self) -> bool {
         self.blocking_query().is_some()
     }
@@ -1567,15 +1621,16 @@ pub trait InputEventQueuer {
     fn select_interrupted(&mut self) {}
 
     fn enqueue_interrupt_key(&mut self) {
-        let vintr = shell_modes().c_cc[libc::VINTR];
+        let vintr = shell_modes().control_chars[libc::VINTR];
         if vintr != 0 {
             let interrupt_evt = CharEvent::from_key(KeyEvent::from_single_byte(vintr));
-            if stop_query(self.blocking_query()) {
-                FLOG!(
+            if stop_query(self.blocking_query_mut()) {
+                flog!(
                     reader,
                     "Received interrupt, giving up on waiting for terminal response"
                 );
                 self.get_input_data_mut().queue.clear();
+                self.push_front(CharEvent::QueryResult(QueryResultEvent::Interrupted));
             } else {
                 self.push_front(interrupt_evt);
             }
@@ -1590,14 +1645,22 @@ pub trait InputEventQueuer {
     /// The default does nothing.
     fn ioport_notified(&mut self) {}
 
-    /// Reset the function status.
-    fn get_function_status(&self) -> bool {
+    /// Get the function status.
+    fn function_status(&self) -> bool {
         self.get_input_data().function_status
     }
 
     /// Return if we have any lookahead.
     fn has_lookahead(&self) -> bool {
         !self.get_input_data().queue.is_empty()
+    }
+
+    fn get_bind_mode(&self) -> WString {
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(cfg!(test));
+        }
+        WString::from("test-bind-mode")
     }
 }
 
@@ -1613,73 +1676,58 @@ pub(crate) enum InvalidPolicy {
     Passthrough,
 }
 
-pub(crate) fn decode_input_byte(
+/// Decode the UTF-8-encoded `buffer`.
+/// On success, the result is appended to `out_seq` and [`DecodeState::Complete`] is returned.
+/// [`DecodeState::Incomplete`] is returned if the buffer contains valid UTF-8
+/// with the exception of the last bytes,
+/// where the last 1 to 3 bytes are a prefix of the encoding of a valid char,
+/// which can happen if input is read incrementally.
+/// In this case `out_seq` will not be modified.
+/// If other errors occur, the behavior depends on `invalid_policy`.
+/// For [`InvalidPolicy::Error`], [`DecodeState::Error`] will be returned, without modifying
+/// `out_seq`.
+/// For [`InvalidPolicy::Passthrough`], [`DecodeState::Complete`] will be returned
+/// and `out_seq` will have the individual bytes of `buffer` appended to it, each encoded using our
+/// PUA encoding scheme.
+pub(crate) fn decode_utf8(
     out_seq: &mut WString,
     invalid_policy: InvalidPolicy,
-    state: &mut mbstate_t,
     buffer: &[u8],
-    consumed: &mut usize,
 ) -> DecodeState {
     use DecodeState::*;
-    let mut res: char = '\0';
-    let read_byte = *buffer.last().unwrap();
-    if crate::libc::MB_CUR_MAX() == 1 {
-        // single-byte locale, all values are legal
-        // FIXME: this looks wrong, this falsely assumes that
-        // the single-byte locale is compatible with Unicode upper-ASCII.
-        res = read_byte.into();
-        out_seq.push(res);
-        return Complete;
-    }
-    let mut invalid = |out_seq: &mut WString, log_error: fn()| match invalid_policy {
-        InvalidPolicy::Error => {
-            (log_error)();
-            Error
-        }
-        InvalidPolicy::Passthrough => {
-            for &b in &buffer[*consumed..] {
-                out_seq.push(encode_byte_to_char(b));
+    match std::str::from_utf8(buffer) {
+        Ok(parsed_str) => {
+            for c in parsed_str.chars() {
+                if !fish_reserved_codepoint(c) {
+                    out_seq.push(c);
+                }
             }
-            *consumed = buffer.len();
             Complete
         }
-    };
-    let mut codepoint = u32::from(res);
-    match unsafe {
-        mbrtowc(
-            std::ptr::addr_of_mut!(codepoint),
-            std::ptr::addr_of!(read_byte).cast(),
-            1,
-            state,
-        )
-    } as isize
-    {
-        -1 => {
-            return invalid(out_seq, || FLOG!(reader, "Illegal input encoding"));
-        }
-        -2 => {
-            // Sequence not yet complete.
-            return Incomplete;
-        }
-        _ => (),
+        Err(e) => match e.error_len() {
+            Some(_) => match invalid_policy {
+                InvalidPolicy::Error => {
+                    flog!(reader, "Illegal input encoding");
+                    Error
+                }
+                InvalidPolicy::Passthrough => {
+                    for &b in buffer {
+                        out_seq.push(encode_byte_to_char(b));
+                    }
+                    Complete
+                }
+            },
+            None => Incomplete,
+        },
     }
-    if let Some(res) = char::from_u32(codepoint) {
-        // Sequence complete.
-        if !fish_reserved_codepoint(res) {
-            *consumed += 1;
-            out_seq.push(res);
-            return Complete;
-        }
-    }
-    invalid(out_seq, || FLOG!(reader, "Illegal codepoint"))
 }
 
-pub(crate) fn stop_query(mut query: RefMut<'_, Option<TerminalQuery>>) -> bool {
+pub(crate) fn stop_query(query: &mut Option<TerminalQuery>) -> bool {
     query.take().is_some()
 }
 
 fn invalid_sequence(buffer: &[u8]) -> Option<KeyEvent> {
-    FLOG!(
+    flog!(
         reader,
         "Error: invalid escape sequence: ",
         DisplayBytes(buffer)
@@ -1705,14 +1753,12 @@ impl<'a> FloggableDisplay for DisplayBytes<'a> {}
 /// A simple, concrete implementation of InputEventQueuer.
 pub struct InputEventQueue {
     data: InputData,
-    blocking_query: RefCell<Option<TerminalQuery>>,
 }
 
 impl InputEventQueue {
-    pub fn new(in_fd: RawFd) -> Self {
+    pub fn new(in_fd: RawFd, blocking_query_timeout: Option<Duration>) -> Self {
         Self {
-            data: InputData::new(in_fd),
-            blocking_query: RefCell::new(None),
+            data: InputData::new(in_fd, blocking_query_timeout),
         }
     }
 }
@@ -1731,9 +1777,6 @@ impl InputEventQueuer for InputEventQueue {
             self.enqueue_interrupt_key();
         }
     }
-    fn blocking_query(&self) -> RefMut<'_, Option<TerminalQuery>> {
-        self.blocking_query.borrow_mut()
-    }
 }
 
 fn parse_hex(hex: &[u8]) -> Option<Vec<u8>> {
@@ -1741,18 +1784,172 @@ fn parse_hex(hex: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut result = vec![0; hex.len() / 2];
+    parse_hex_into(&mut result, hex)?;
+    Some(result)
+}
+fn parse_hex_into(out: &mut [u8], hex: &[u8]) -> Option<()> {
+    assert_eq!(out.len() * 2, hex.len());
     let mut i = 0;
     while i < hex.len() {
         let d1 = char::from(hex[i]).to_digit(16)?;
         let d2 = char::from(hex[i + 1]).to_digit(16)?;
         let decoded = u8::try_from(16 * d1 + d2).unwrap();
-        result[i / 2] = decoded;
+        out[i / 2] = decoded;
         i += 2;
     }
-    Some(result)
+    Some(())
 }
 
-#[test]
-fn test_parse_hex() {
-    assert_eq!(parse_hex(b"3d"), Some(vec![61]));
+#[cfg(test)]
+mod tests {
+    use super::{
+        CharEvent, InputEventQueue, InputEventQueuer as _, KeyEvent, KeyMatchQuality, ReadlineCmd,
+        match_key_event_to_key, parse_hex,
+    };
+    use crate::key::{Key, Modifiers};
+
+    #[test]
+    fn test_match_key_event_to_key() {
+        macro_rules! validate {
+            ($evt:expr, $key:expr, $expected:expr) => {
+                assert_eq!(match_key_event_to_key(&$evt, &$key), $expected);
+            };
+        }
+
+        let none = Modifiers::default();
+        let shift = Modifiers::SHIFT;
+        let ctrl = Modifiers::CTRL;
+        let ctrl_shift = Modifiers {
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+
+        let exact = KeyMatchQuality::Exact;
+        let modulo_shift = KeyMatchQuality::ModuloShift;
+        let base_layout = KeyMatchQuality::BaseLayout;
+        let base_layout_modulo_shift = KeyMatchQuality::BaseLayoutModuloShift;
+
+        validate!(KeyEvent::new(none, 'a'), Key::new(none, 'a'), Some(exact));
+        validate!(KeyEvent::new(none, 'a'), Key::new(none, 'A'), None);
+        validate!(KeyEvent::new(shift, 'a'), Key::new(shift, 'a'), Some(exact));
+        validate!(KeyEvent::new(shift, 'a'), Key::new(none, 'A'), None);
+        validate!(KeyEvent::new(shift, 'ä'), Key::new(none, 'Ä'), None);
+        // For historical reasons we canonicalize notation for ASCII keys like "shift-a" to "A",
+        // but not "shift-a" events - those should send a shifted key.
+        validate!(
+            KeyEvent::new(none, 'A'),
+            Key::new(shift, 'a'),
+            Some(modulo_shift)
+        );
+        validate!(KeyEvent::new(none, 'A'), Key::new(shift, 'A'), None);
+        validate!(KeyEvent::new(none, 'Ä'), Key::new(none, 'Ä'), Some(exact));
+        validate!(KeyEvent::new(none, 'Ä'), Key::new(shift, 'ä'), None);
+
+        // FYI: for codepoints that are not letters with uppercase/lowercase versions, we use
+        // the shifted key in the canonical notation, because the unshifted one may depend on the
+        // keyboard layout.
+        let ctrl_shift_equals = KeyEvent::new_with(ctrl_shift, '=', Some('+'), None);
+        validate!(ctrl_shift_equals, Key::new(ctrl_shift, '='), Some(exact));
+        validate!(ctrl_shift_equals, Key::new(ctrl, '+'), Some(modulo_shift)); // canonical notation
+        validate!(ctrl_shift_equals, Key::new(ctrl_shift, '+'), None);
+        validate!(ctrl_shift_equals, Key::new(ctrl, '='), None);
+
+        // A event like capslock-shift-ä may or may not include a shifted codepoint.
+        //
+        // Without a shifted codepoint, we cannot easily match ctrl-Ä.
+        let caps_ctrl_shift_ä = KeyEvent::new(ctrl_shift, 'ä');
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'ä'), Some(exact)); // canonical notation
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'ä'), None);
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'Ä'), None); // can't match without shifted key
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'Ä'), None);
+        // With a shifted codepoint, we can match the alternative notation too.
+        let caps_ctrl_shift_ä = KeyEvent::new_with(ctrl_shift, 'ä', Some('Ä'), None);
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'ä'), Some(exact)); // canonical notation
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'ä'), None);
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl, 'Ä'), Some(modulo_shift)); // matched via shifted key
+        validate!(caps_ctrl_shift_ä, Key::new(ctrl_shift, 'Ä'), None);
+
+        let ctrl_ц = KeyEvent::new_with(ctrl, 'ц', None, Some('w'));
+        let ctrl_shift_ц = KeyEvent::new_with(ctrl_shift, 'ц', Some('Ц'), Some('w'));
+        validate!(ctrl_ц, Key::new(ctrl, 'ц'), Some(exact));
+        validate!(ctrl_ц, Key::new(ctrl, 'w'), Some(base_layout));
+        validate!(ctrl_ц, Key::new(ctrl_shift, 'ц'), None);
+        validate!(ctrl_ц, Key::new(ctrl_shift, 'w'), None);
+        validate!(
+            ctrl_shift_ц,
+            Key::new(ctrl, 'W'),
+            Some(base_layout_modulo_shift)
+        );
+        validate!(ctrl_shift_ц, Key::new(ctrl, 'w'), None);
+
+        // Note that "bind ctrl-Ц" will win over "bind ctrl-shift-w".
+        // This is because we consider shift transformation to be less magic than base-key
+        // transformation.
+        validate!(ctrl_shift_ц, Key::new(ctrl, 'Ц'), Some(modulo_shift));
+        validate!(ctrl_shift_ц, Key::new(ctrl_shift, 'w'), Some(base_layout));
+    }
+
+    #[test]
+    fn test_push_front_back() {
+        let mut queue = InputEventQueue::new(0, None);
+        queue.push_front(CharEvent::from_char('a'));
+        queue.push_front(CharEvent::from_char('b'));
+        queue.push_back(CharEvent::from_char('c'));
+        queue.push_back(CharEvent::from_char('d'));
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'b');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'a');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'c');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'd');
+        assert!(queue.try_pop().is_none());
+    }
+
+    #[test]
+    fn test_promote_interruptions_to_front() {
+        let mut queue = InputEventQueue::new(0, None);
+        queue.push_back(CharEvent::from_char('a'));
+        queue.push_back(CharEvent::from_char('b'));
+        queue.push_back(CharEvent::from_readline(ReadlineCmd::Undo));
+        queue.push_back(CharEvent::from_readline(ReadlineCmd::Redo));
+        queue.push_back(CharEvent::from_char('c'));
+        queue.push_back(CharEvent::from_char('d'));
+        queue.promote_interruptions_to_front();
+
+        assert_eq!(queue.try_pop().unwrap().get_readline(), ReadlineCmd::Undo);
+        assert_eq!(queue.try_pop().unwrap().get_readline(), ReadlineCmd::Redo);
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'a');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'b');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'c');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'd');
+        assert!(!queue.has_lookahead());
+
+        queue.push_back(CharEvent::from_char('e'));
+        queue.promote_interruptions_to_front();
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'e');
+        assert!(!queue.has_lookahead());
+    }
+
+    #[test]
+    fn test_insert_front() {
+        let mut queue = InputEventQueue::new(0, None);
+        queue.push_back(CharEvent::from_char('a'));
+        queue.push_back(CharEvent::from_char('b'));
+
+        let events = vec![
+            CharEvent::from_char('A'),
+            CharEvent::from_char('B'),
+            CharEvent::from_char('C'),
+        ];
+        queue.insert_front(events);
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'A');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'B');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'C');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'a');
+        assert_eq!(queue.try_pop().unwrap().get_char(), 'b');
+    }
+
+    #[test]
+    fn test_parse_hex() {
+        assert_eq!(parse_hex(b"3d"), Some(vec![61]));
+    }
 }

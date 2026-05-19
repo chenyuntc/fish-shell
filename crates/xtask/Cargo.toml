@@ -1,0 +1,19 @@
+[package]
+name = "xtask"
+version = "0.0.0"
+rust-version.workspace = true
+edition.workspace = true
+repository.workspace = true
+
+[dependencies]
+anstyle.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+fish-build-helper.workspace = true
+fish-common.workspace = true
+fish-tempfile.workspace = true
+fish-widestring.workspace = true
+ignore.workspace = true
+pcre2.workspace = true
+walkdir.workspace = true

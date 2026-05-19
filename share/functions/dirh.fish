@@ -1,3 +1,4 @@
+# localization: tier1
 function dirh --description "Print the current directory history (the prev and next lists)"
     set -l options h/help
     argparse -n dirh --max-args=0 $options -- $argv
@@ -18,7 +19,7 @@ function dirh --description "Print the current directory history (the prev and n
         end
     end
 
-    echo (set_color $fish_color_history_current)'   ' $PWD(set_color normal)
+    echo (set_color $fish_color_history_current)'   ' $PWD(set_color --reset)
 
     set -l dirc (count $dirnext)
     if test $dirc -gt 0

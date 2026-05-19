@@ -1,9 +1,7 @@
 use std::ops::Range;
 
-#[allow(unused_imports)]
-use crate::future::IsSomeAnd;
 use crate::highlight::HighlightSpec;
-use crate::wchar::prelude::*;
+use crate::prelude::*;
 
 /// An edit action that can be undone.
 #[derive(Clone, Eq, PartialEq)]
@@ -20,7 +18,7 @@ pub struct Edit {
     pub replacement: WString,
 
     /// edit_t is only for contiguous changes, so to restore a group of arbitrary changes to the
-    /// command line we need to have a group id as forcibly coalescing changes is not enough.
+    /// command line we need to have a group ID as forcibly coalescing changes is not enough.
     group_id: Option<usize>,
 }
 
@@ -52,7 +50,7 @@ pub fn apply_edit(target: &mut WString, colors: &mut Vec<HighlightSpec>, edit: &
         .unwrap_or_default();
     colors.splice(
         range.clone(),
-        std::iter::repeat(last_color).take(edit.replacement.len()),
+        std::iter::repeat_n(last_color, edit.replacement.len()),
     );
 }
 
@@ -156,7 +154,7 @@ impl EditableLine {
         let is_insertion = range.is_empty();
         // Coalescing insertion does not create a new undo entry but adds to the last insertion.
         if allow_coalesce && is_insertion && self.want_to_coalesce_insertion_of(&edit.replacement) {
-            assert!(range.start == self.position());
+            assert_eq!(range.start, self.position());
             let last_edit = self.undo_history.edits.last_mut().unwrap();
             last_edit.replacement.push_utfstr(&edit.replacement);
             apply_edit(&mut self.text, &mut self.colors, &edit);
@@ -170,7 +168,7 @@ impl EditableLine {
             return; // nop
         }
 
-        // Assign a new group id or propagate the old one if we're in a logical grouping of edits
+        // Assign a new group ID or propagate the old one if we're in a logical grouping of edits
         if self.edit_group_level.is_some() {
             edit.group_id = Some(self.edit_group_id);
         }
@@ -273,7 +271,7 @@ impl EditableLine {
         self.undo_history.may_coalesce = false;
         // Indicate that future changes should be coalesced into the same edit if possible.
         self.undo_history.try_coalesce = true;
-        // Assign a logical edit group id to future edits in this group
+        // Assign a logical edit group ID to future edits in this group
         self.edit_group_id += 1;
     }
 
@@ -348,14 +346,12 @@ pub fn range_of_line_at_cursor(buffer: &wstr, cursor: usize) -> Range<usize> {
         .as_char_slice()
         .iter()
         .rposition(|&c| c == '\n')
-        .map(|newline| newline + 1)
-        .unwrap_or(0);
+        .map_or(0, |newline| newline + 1);
     let mut end = buffer[cursor..]
         .as_char_slice()
         .iter()
         .position(|&c| c == '\n')
-        .map(|pos| cursor + pos)
-        .unwrap_or(buffer.len());
+        .map_or(buffer.len(), |pos| cursor + pos);
     // Remove any trailing newline
     if end != start && buffer.char_at(end - 1) == '\n' {
         end -= 1;
@@ -365,4 +361,81 @@ pub fn range_of_line_at_cursor(buffer: &wstr, cursor: usize) -> Range<usize> {
 
 pub fn line_at_cursor(buffer: &wstr, cursor: usize) -> &wstr {
     &buffer[range_of_line_at_cursor(buffer, cursor)]
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{
+        editable_line::{Edit, EditableLine},
+        prelude::*,
+    };
+
+    #[test]
+    fn test_undo() {
+        let mut line = EditableLine::default();
+
+        let insert = |line: &EditableLine| line.position()..line.position();
+
+        assert!(!line.undo()); // nothing to undo
+        assert!(line.text().is_empty());
+        assert_eq!(line.position(), 0);
+        line.push_edit(Edit::new(0..0, L!("a b c").to_owned()), true);
+        assert_eq!(line.text(), L!("a b c").to_owned());
+        assert_eq!(line.position(), 5);
+        line.set_position(2);
+        line.push_edit(Edit::new(2..3, L!("B").to_owned()), true); // replacement right of cursor
+        assert_eq!(line.text(), L!("a B c").to_owned());
+        line.undo();
+        assert_eq!(line.text(), L!("a b c").to_owned());
+        assert_eq!(line.position(), 2);
+        line.redo();
+        assert_eq!(line.text(), L!("a B c").to_owned());
+        assert_eq!(line.position(), 3);
+
+        assert!(!line.redo()); // nothing to redo
+
+        line.push_edit(Edit::new(0..2, L!("").to_owned()), true); // deletion left of cursor
+        assert_eq!(line.text(), L!("B c").to_owned());
+        assert_eq!(line.position(), 1);
+        line.undo();
+        assert_eq!(line.text(), L!("a B c").to_owned());
+        assert_eq!(line.position(), 3);
+        line.redo();
+        assert_eq!(line.text(), L!("B c").to_owned());
+        assert_eq!(line.position(), 1);
+
+        line.push_edit(Edit::new(0..line.len(), L!("a b c").to_owned()), true); // replacement left and right of cursor
+        assert_eq!(line.text(), L!("a b c").to_owned());
+        assert_eq!(line.position(), 5);
+
+        // Undo coalesced edits
+        line.push_edit(Edit::new(0..line.len(), L!("").to_owned()), false);
+        line.push_edit(Edit::new(insert(&line), L!("a").to_owned()), true);
+        line.push_edit(Edit::new(insert(&line), L!("b").to_owned()), true);
+        line.push_edit(Edit::new(insert(&line), L!("c").to_owned()), true);
+        line.push_edit(Edit::new(insert(&line), L!(" ").to_owned()), true);
+        line.undo();
+        line.undo();
+        line.redo();
+        assert_eq!(line.text(), L!("abc").to_owned());
+        // This removes the space insertion from the history, but does not coalesce with the first edit.
+        line.push_edit(Edit::new(insert(&line), L!("d").to_owned()), true);
+        line.push_edit(Edit::new(insert(&line), L!("e").to_owned()), true);
+        assert_eq!(line.text(), L!("abcde").to_owned());
+        line.undo();
+        assert_eq!(line.text(), L!("abc").to_owned());
+    }
+
+    #[test]
+    fn test_undo_group() {
+        let mut line = EditableLine::default();
+        line.begin_edit_group();
+        line.push_edit(Edit::new(0..0, L!("a").to_owned()), true);
+        line.end_edit_group();
+        line.begin_edit_group();
+        line.push_edit(Edit::new(1..1, L!("b").to_owned()), true);
+        line.end_edit_group();
+        line.undo();
+        assert_eq!(line.text(), "a");
+    }
 }

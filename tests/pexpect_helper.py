@@ -150,7 +150,12 @@ class SpawnedProc(object):
     """
 
     def __init__(
-        self, name="fish", timeout=TIMEOUT_SECS, env=os.environ.copy(), **kwargs
+        self,
+        name="fish",
+        timeout=TIMEOUT_SECS,
+        env=os.environ.copy(),
+        scroll_content_up_supported: bool = False,
+        **kwargs,
     ):
         """Construct from a name, timeout, and environment.
 
@@ -174,13 +179,28 @@ class SpawnedProc(object):
         self.colorize = sys.stdout.isatty() or env.get("FISH_FORCE_COLOR", "0") == "1"
         self.messages = []
         self.start_time = None
+        if "FISH_TEST_NO_RECURRENT_QUERIES" not in env:
+            env["FISH_TEST_NO_RECURRENT_QUERIES"] = "1"
         self.spawn = pexpect.spawn(
             exe_path, env=env, encoding="utf-8", timeout=timeout, **kwargs
         )
         self.spawn.delaybeforesend = None
         self.prompt_counter = 0
+        if scroll_content_up_supported:
+            # XTGETTCAP
+            key = bytes.hex(b"indn")
+            value = bytes.hex(b"dont-care")
+            self.spawn.send(f"\x1bP1+r{key}={value}\x1b\\")
         if env.get("TERM") != "dumb":
-            self.spawn.send("\x1b[?123c")  # Primary Device Attribute
+            self.send_primary_device_attribute()
+
+    def send_cursor_position_report(self, *, y: int, x: int):
+        assert x != 0
+        assert y != 0
+        self.spawn.send(f"\x1b[{y};{x}R")
+
+    def send_primary_device_attribute(self):
+        self.spawn.send("\x1b[?123c")  # Primary Device Attribute
 
     def time_since_first_message(self):
         """Return a delta in seconds since the first message, or 0 if this is the first."""
@@ -341,7 +361,7 @@ class SpawnedProc(object):
                     filename=m.filename,
                     lineno=m.lineno,
                     etext=etext,
-                    **colors
+                    **colors,
                 )
             )
         print("")

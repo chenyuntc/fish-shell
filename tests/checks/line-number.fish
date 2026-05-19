@@ -16,9 +16,19 @@ emit linenumber
 type --nonexistent-option-so-we-get-a-backtrace
 # CHECKERR: type: --nonexistent-option-so-we-get-a-backtrace: unknown option
 
+type --short=cd
+# CHECKERR: type: --short=cd: option does not take an argument
+
 function line-number
     status line-number
 end
 
 line-number
-# CHECK: 20
+# CHECK: 23
+
+bind -M
+# CHECKERR: bind: -M: option requires an argument
+# CHECKERR: {{.*}} (line 29):
+# CHECKERR: bind -M
+# CHECKERR: ^
+# CHECKERR: (Type 'help bind' for related documentation)

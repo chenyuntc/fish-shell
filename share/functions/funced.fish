@@ -1,3 +1,4 @@
+# localization: tier1
 function funced --description 'Edit function definition'
     set -l options h/help 'e/editor=' i/interactive s/save
     argparse -n funced --max-args=1 $options -- $argv
@@ -9,7 +10,7 @@ function funced --description 'Edit function definition'
     end
 
     if not set -q argv[1]
-        printf (_ "%ls: Expected at least %d args, got only %d\n") funced 1 0
+        printf (_ "%s: Expected at least %d args, got only %d\n") funced 1 0
         return 1
     end
 
@@ -38,18 +39,22 @@ function funced --description 'Edit function definition'
     end
 
     if not type -q -f "$editor[1]"
-        echo (_ "funced: The value for \$EDITOR '$editor' could not be used because the command '$editor[1]' could not be found") >&2
+        printf >&2 \
+            (_ "funced: The value for \$%s '%s' could not be used because the command '%s' could not be found\n") \
+            (set -q VISUAL && echo VISUAL || echo EDITOR) \
+            "$editor" \
+            $editor[1]
         set editor fish
     end
 
     if test "$editor" = fish
         if functions -q -- $funcname
-            functions --no-details -- $funcname | __fish_indent --only-unindent | __fish_indent --no-indent | read -z init
+            functions --no-details -- $funcname | fish_indent --only-unindent | fish_indent --no-indent | read -z init
         end
 
-        set -l prompt 'printf "%s%s%s> " (set_color green) $funcname (set_color normal)'
+        set -l prompt 'printf "%s%s%s> " (set_color green) $funcname (set_color --reset)'
         if read -p $prompt -c "$init" --shell cmd
-            echo -n $cmd | __fish_indent --only-unindent | read -lz cmd
+            echo -n $cmd | fish_indent --only-unindent | read -lz cmd
             eval "$cmd"
         end
         if set -q _flag_save
@@ -58,12 +63,9 @@ function funced --description 'Edit function definition'
         return 0
     end
 
-    # OS X (macOS) `mktemp` is rather restricted - no suffix, no way to automatically use TMPDIR.
-    # Create a directory so we can use a ".fish" suffix for the file - makes editors pick up that
-    # it's a fish file.
-    set -q TMPDIR
-    or set -l TMPDIR /tmp
-    set -l tmpdir (mktemp -d $TMPDIR/fish.XXXXXX)
+    # Create a directory so we can use a ".fish" suffix for the file -
+    # makes editors pick up that it's a fish file.
+    set -l tmpdir (__fish_mktemp_relative -d fish-funced)
     or return 1
     set -l tmpname $tmpdir/$funcname.fish
 
@@ -89,9 +91,8 @@ function funced --description 'Edit function definition'
     # Repeatedly edit until it either parses successfully, or the user cancels
     # If the editor command itself fails, we assume the user cancelled or the file
     # could not be edited, and we do not try again
+    set -l checksum (__fish_md5 "$tmpname")
     while true
-        set -l checksum (__fish_md5 "$tmpname")
-
         if not $editor $tmpname
             echo (_ "Editing failed or was cancelled")
         else

@@ -1,9 +1,7 @@
-.. _completion-own:
-
 Writing your own completions
 ============================
 
-To specify a completion, use the ``complete`` command. ``complete`` takes as a parameter the name of the command to specify a completion for. For example, to add a completion for the program ``myprog``, start the completion command with ``complete -c myprog ...``
+To specify a completion, use the ``complete`` command. ``complete`` takes as a parameter the name of the command to specify a completion for. For example, to add a completion for the program ``myprog`` (or ``myprog.exe`` on :ref:`Cygwin/MSYS2 <completions-cygwin>`), start the completion command with ``complete -c myprog ...``
 
 For a complete description of the various switches accepted by the ``complete`` command, see the documentation for the :doc:`complete <cmds/complete>` builtin, or write ``complete --help`` inside the ``fish`` shell.
 
@@ -116,8 +114,6 @@ As a more comprehensive example, here's a commented excerpt of the completions f
 
 For examples of how to write your own complex completions, study the completions in ``/usr/share/fish/completions``. (The exact path depends on your chosen installation prefix and may be slightly different)
 
-.. _completion-func:
-
 Useful functions for writing completions
 ----------------------------------------
 
@@ -143,8 +139,6 @@ Functions beginning with the string ``__fish_print_`` print a newline separated 
 
 - ``__fish_print_interfaces`` prints a list of all known network interfaces.
 
-.. _completion-path:
-
 Where to put completions
 ------------------------
 
@@ -156,7 +150,7 @@ By default, Fish searches the following for completions, using the first availab
 - A directory for systems administrators to install completions for all users on the system, usually ``/etc/fish/completions``;
 - A user-specified directory for third-party vendor completions, usually ``~/.local/share/fish/vendor_completions.d`` (controlled by the ``XDG_DATA_HOME`` environment variable);
 - A directory for third-party software vendors to ship their own completions for their software, usually ``/usr/share/fish/vendor_completions.d``;
-- The completions shipped with fish, usually installed in ``/usr/share/fish/completions``; and
+- The completions shipped with fish, which are stored in the fish program and can be seen with ``status list-files``; and
 - Completions automatically generated from the operating system's manual, usually stored in ``~/.cache/fish/generated_completions`` (controlled by ``XDG_CACHE_HOME`` environment variable).
 
 These paths are controlled by parameters set at build, install, or run time, and may vary from the defaults listed above.
@@ -166,4 +160,3 @@ This wide search may be confusing. If you are unsure, your completions probably 
 If you have written new completions for a common Unix command, please consider sharing your work by submitting it via the instructions in :ref:`Further help and development <more-help>`.
 
 If you are developing another program and would like to ship completions with your program, install them to the "vendor" completions directory. As this path may vary from system to system, the ``pkgconfig`` framework should be used to discover this path with the output of ``pkg-config --variable completionsdir fish``.
-

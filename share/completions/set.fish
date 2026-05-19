@@ -30,10 +30,11 @@ end
 function __fish_set_is_locale -d 'Test if We are specifying a locale value for the prompt'
     set -l cmd (commandline -pxc)
     set -e cmd[1]
+    set -l locale_vars (__fish_locale_vars)
     for i in $cmd
         switch $i
 
-            case LANG LC_ALL LC_COLLATE LC_CTYPE LC_MESSAGES LC_MONETARY LC_NUMERIC LC_TIME
+            case $locale_vars
                 return 0
 
             case '-*'
@@ -44,6 +45,12 @@ function __fish_set_is_locale -d 'Test if We are specifying a locale value for t
         end
     end
     return 1
+end
+
+function __fish_complete_special_vars_ifndef -a varname description
+    if not set -q $varname
+        printf "%s\t%s\n" $varname "Undefined Variable; $description"
+    end
 end
 
 function __fish_complete_special_vars
@@ -68,7 +75,8 @@ function __fish_complete_special_vars
         fish_trace "Enables execution tracing (if set to non-empty value)" \
         fish_transient_prompt "set to 1 to re-run prompts before pushing them to scrollback" \
         fish_user_paths "A list of dirs to prepend to PATH"
-
+    __fish_complete_special_vars_ifndef fish_color_option 'defaults to $fish_color_param'
+    __fish_complete_special_vars_ifndef fish_color_keyword 'defaults to $fish_color_command'
 end
 
 #
@@ -110,7 +118,7 @@ set -l maybe_filter_private_vars '
     )'
 # We do not *filter* these by the given scope because you might want to set e.g. a global to shadow a universal.
 complete -c set -n '__fish_is_nth_token 1; and not __fish_seen_argument -s e -l erase' -x -a "(set -U | $maybe_filter_private_vars | string replace ' ' \t'Universal Variable: ')"
-complete -c set -n '__fish_is_nth_token 1; and not __fish_seen_argument -s e -l erase' -x -a "(set -g | $maybe_filter_private_vars | string replace -r '^((?:history|fish_killring) ).*' '$1' | string replace ' ' \t'Global Variable: ')"
+complete -c set -n '__fish_is_nth_token 1; and not __fish_seen_argument -s e -l erase' -x -a "(set -g | $maybe_filter_private_vars | string replace -r '^((?:history|fish_killring) ).*' '\$1' | string replace ' ' \t'Global Variable: ')"
 complete -c set -n '__fish_is_nth_token 1; and not __fish_seen_argument -s e -l erase' -x -a "(set -l | $maybe_filter_private_vars | string replace ' ' \t'Local Variable: ')"
 # Complete some fish configuration variables even if they aren't set.
 complete -c set -n '__fish_is_nth_token 1; and not __fish_seen_argument -s e -l erase' -x -a "(__fish_complete_special_vars)"
@@ -131,6 +139,7 @@ complete -c set -n '__fish_set_is_color false true' -a '--underline-color=(set_c
 complete -c set -n '__fish_set_is_color true false' -a --bold -x
 complete -c set -n '__fish_set_is_color true false' -a --dim -x
 complete -c set -n '__fish_set_is_color true false' -a --italics -x
+complete -c set -n '__fish_set_is_color true false' -a --strikethrough -x
 complete -c set -n '__fish_set_is_color true true' -a --reverse -x
 complete -c set -n '__fish_set_is_color true false' -a --underline -x
 complete -c set -n '__fish_set_is_color true false' -a--underline={double,curly,dotted,dashed} -x

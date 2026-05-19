@@ -1,5 +1,6 @@
+# localization: skip(private)
 function __fish_seen_argument --description 'Check whether argument is used'
-    argparse --ignore-unknown 's/short=+' 'o/old=+' 'l/long=+' 'w/windows=+' -- $argv
+    argparse --move-unknown 's/short=+&' 'o/old=+&' 'l/long=+&' 'w/windows=+&' -- $argv
 
     set --local tokens (commandline --current-process --tokens-expanded --cut-at-cursor)
     set --erase tokens[1]
@@ -30,7 +31,7 @@ function __fish_seen_argument --description 'Check whether argument is used'
             end
         end
 
-        for raw_arg in $argv
+        for raw_arg in $argv_opts $argv
             if string match --quiet -- $t $raw_arg
                 return 0
             end

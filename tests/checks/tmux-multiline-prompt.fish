@@ -4,15 +4,14 @@
 # disable on github actions because it's flakey
 #REQUIRES: test -z "$CI"
 
-isolated-tmux-start
-
-isolated-tmux send-keys '
+isolated-tmux-start -C '
     function fish_prompt
         printf "prompt-line-1\\nprompt-line-2> "
         commandline -f repaint
     end
-' Enter
-isolated-tmux send-keys C-l ': 1' Enter
+'
+
+isolated-tmux send-keys ': 1' Enter
 tmux-sleep
 isolated-tmux send-keys ': 3' Enter
 tmux-sleep
@@ -49,8 +48,8 @@ isolated-tmux capture-pane -p | tail -n 5
 # CHECK:
 # CHECK:
 
-# Test repainint after running an external program that uses the alternate screen.
-isolated-tmux send-keys "bind ctrl-r 'echo | less +q; commandline \"echo Hello World\"'" Enter C-l
+# Test repainting after running an external program that uses the alternate screen.
+isolated-tmux send-keys "bind ctrl-r 'echo | less -+F -+X +q; commandline \"echo Hello World\"'" Enter C-l
 isolated-tmux send-keys C-r
 tmux-sleep
 isolated-tmux send-keys Enter
@@ -59,5 +58,20 @@ isolated-tmux capture-pane -p
 # CHECK: prompt-line-1
 # CHECK: prompt-line-2> echo Hello World
 # CHECK: Hello World
+# CHECK: prompt-line-1
+# CHECK: prompt-line-2>
+
+# Test that transient prompt does not break the prompt.
+isolated-tmux send-keys C-l "set fish_transient_prompt 1" Enter
+tmux-sleep
+isolated-tmux send-keys : Enter Enter
+tmux-sleep
+isolated-tmux capture-pane -p
+# CHECK: prompt-line-1
+# CHECK: prompt-line-2> set fish_transient_prompt 1
+# CHECK: prompt-line-1
+# CHECK: prompt-line-2> :
+# CHECK: prompt-line-1
+# CHECK: prompt-line-2>
 # CHECK: prompt-line-1
 # CHECK: prompt-line-2>

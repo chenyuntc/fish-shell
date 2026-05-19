@@ -11,13 +11,20 @@ Contributions are welcome, and there are many ways to contribute!
 Whether you want to change some of the core Rust source, enhance or add a completion script or function,
 improve the documentation or translate something, this document will tell you how.
 
-Getting Set Up
-==============
 
-Fish is developed on Github, at https://github.com/fish-shell/fish-shell.
+Mailing List
+============
+
+Send patches to the public mailing list: mailto:~krobelus/fish-shell@lists.sr.ht.
+Archives are available at https://lists.sr.ht/~krobelus/fish-shell/.
+
+GitHub
+======
+
+Fish is available on GitHub, at https://github.com/fish-shell/fish-shell.
 
 First, you'll need an account there, and you'll need a git clone of fish.
-Fork it on Github and then run::
+Fork it on GitHub and then run::
 
   git clone https://github.com/<USERNAME>/fish-shell.git
 
@@ -29,7 +36,7 @@ For that, you'll require:
 -  Rust - when in doubt, try rustup
 -  CMake
 -  PCRE2 (headers and libraries) - optional, this will be downloaded if missing
--  gettext (headers and libraries) - optional, for translation support
+-  gettext (only the msgfmt tool) - optional, for translation support
 -  Sphinx - optional, to build the documentation
 
 Of course not everything is required always - if you just want to contribute something to the documentation you'll just need Sphinx,
@@ -43,7 +50,24 @@ Guidelines
 In short:
 
 - Be conservative in what you need (keep to the agreed minimum supported Rust version, limit new dependencies)
-- Use automated tools to help you (including ``make fish_run_tests`` and ``build_tools/style.fish``)
+- Use automated tools to help you (``cargo xtask check``)
+
+Commit History
+==============
+
+We use a linear, `recipe-style <https://www.bitsnbites.eu/git-history-work-log-vs-recipe/>`__ history.
+Every commit should pass our checks.
+We do not want "fixup" commits in our history.
+If you notice an issue with a commit in a pull request, or get feedback suggesting changes,
+you should rewrite the commit history and fix the relevant commits directly,
+instead of adding new "fixup" commits.
+When a pull request is ready, we rebase it on top of the current master branch,
+so don't be shy about rewriting the history of commits which are not on master yet.
+Rebasing (not merging) your pull request on the latest version of master is also welcome, especially if it resolves conflicts.
+
+If you're using Git, consider using `jj <https://www.jj-vcs.dev/>`__ to make this easier.
+
+If a commit should close an issue, add a ``Fixes #<issue-number>`` line at the end of the commit description.
 
 Contributing completions
 ========================
@@ -64,7 +88,7 @@ Completion scripts should
 
 1. Use as few dependencies as possible - try to use fish's builtins like ``string`` instead of ``grep`` and ``awk``,
    use ``python`` to read json instead of ``jq`` (because it's already a soft dependency for fish's tools)
-2. If it uses a common unix tool, use posix-compatible invocations - ideally it would work on GNU/Linux, macOS, the BSDs and other systems
+2. If it uses a common unix tool, use POSIX-compatible invocations - ideally it would work on GNU/Linux, macOS, the BSDs and other systems
 3. Option and argument descriptions should be kept short.
    The shorter the description, the more likely it is that fish can use more columns.
 4. Function names should start with ``__fish``, and functions should be kept in the completion file unless they're used elsewhere.
@@ -81,45 +105,40 @@ Contributing documentation
 ==========================
 
 The documentation is stored in ``doc_src/``, and written in ReStructured Text and built with Sphinx.
+The builtins and various functions shipped with fish are documented in ``doc_src/cmds/``.
 
-To build it locally, run from the main fish-shell directory::
+To build an HTML version of the docs locally, run::
 
-    sphinx-build -j 8 -b html -n doc_src/ /tmp/fish-doc/
+    cargo xtask html-docs
 
-which will build the docs as html in /tmp/fish-doc. You can open it in a browser and see that it looks okay.
+will output to ``target/fish-docs/html`` or, if you use CMake::
 
-The builtins and various functions shipped with fish are documented in doc_src/cmds/.
+    cmake --build build -t sphinx-docs
+
+will output to ``build/cargo/fish-docs/html/``. You can also run ``sphinx-build`` directly, which allows choosing the output directory::
+
+    sphinx-build -j auto -b html doc_src/ /tmp/fish-doc/
+
+will output HTML docs to ``/tmp/fish-doc``.
+
+After building them, you can open the HTML docs in a browser and see that it looks okay.
+
 
 Code Style
 ==========
 
-To ensure your changes conform to the style rules run
-
-::
-
-   build_tools/style.fish
-
-before committing your change. That will run our autoformatters:
+For formatting, we use:
 
 - ``rustfmt`` for Rust
 - ``fish_indent`` (shipped with fish) for fish script
-- ``black`` for python
+- ``ruff format`` for Python
 
-If you’ve already committed your changes that’s okay since it will then
-check the files in the most recent commit. This can be useful after
-you’ve merged another person’s change and want to check that it’s style
-is acceptable. However, in that case it will run ``clang-format`` to
-ensure the entire file, not just the lines modified by the commit,
-conform to the style.
-
-If you want to check the style of the entire code base run
+To reformat files, there is an xtask
 
 ::
 
-   build_tools/style.fish --all
-
-That command will refuse to restyle any files if you have uncommitted
-changes.
+   cargo xtask format --all
+   cargo xtask format somefile.rs some.fish
 
 Fish Script Style Guide
 -----------------------
@@ -171,10 +190,10 @@ made to run fish_indent via e.g.
    (add-hook 'fish-mode-hook (lambda ()
        (add-hook 'before-save-hook 'fish_indent-before-save)))
 
-Rust Style Guide
-----------------
+Minimum Supported Rust Version (MSRV) Policy
+--------------------------------------------
 
-Use ``cargo fmt`` and ``cargo clippy``. Clippy warnings can be turned off if there's a good reason to.
+We support at least the version of ``rustc`` available in Debian Stable.
 
 Testing
 =======
@@ -183,135 +202,110 @@ The source code for fish includes a large collection of tests. If you
 are making any changes to fish, running these tests is a good way to make
 sure the behaviour remains consistent and regressions are not
 introduced. Even if you don’t run the tests on your machine, they will
-still be run via Github Actions.
+still be run via GitHub Actions.
 
 You are strongly encouraged to add tests when changing the functionality
 of fish, especially if you are fixing a bug to help ensure there are no
 regressions in the future (i.e., we don’t reintroduce the bug).
 
-The tests can be found in three places:
+Unit tests live next to the implementation in Rust source files, in inline submodules (``mod tests {}``).
 
-- src/tests for unit tests.
-- tests/checks for script tests, run by `littlecheck <https://github.com/ridiculousfish/littlecheck>`__
-- tests/pexpects for interactive tests using `pexpect <https://pexpect.readthedocs.io/en/stable/>`__
+System tests live in ``tests/``:
 
-When in doubt, the bulk of the tests should be added as a littlecheck test in tests/checks, as they are the easiest to modify and run, and much faster and more dependable than pexpect tests. The syntax is fairly self-explanatory. It's a fish script with the expected output in ``# CHECK:`` or ``# CHECKERR:`` (for stderr) comments.
-If your littlecheck test has a specific dependency, use ``# REQUIRE: ...`` with a posix sh script.
+- ``tests/checks`` are run by `littlecheck <https://github.com/ridiculousfish/littlecheck>`__
+  and test noninteractive (script) behavior,
+  except for ``tests/checks/tmux-*`` which test interactive scenarios.
+- ``tests/pexpects`` tests interactive scenarios using `pexpect <https://pexpect.readthedocs.io/en/stable/>`__
 
-The pexpects are written in python and can simulate input and output to/from a terminal, so they are needed for anything that needs actual interactivity. The runner is in tests/pexpect_helper.py, in case you need to modify something there.
+When in doubt, the bulk of the tests should be added as a littlecheck test in tests/checks, as they are the easiest to modify and run, and much faster and more dependable than pexpect tests.
+The syntax is fairly self-explanatory.
+It's a fish script with the expected output in ``# CHECK:`` or ``# CHECKERR:`` (for stderr) comments.
+If your littlecheck test has a specific dependency, use ``# REQUIRE: ...`` with a POSIX sh script.
 
-These tests can be run via the tests/test_driver.py python script, which will set up the environment.
+The pexpect tests are written in Python and can simulate input and output to/from a terminal, so they are needed for anything that needs actual interactivity.
+The runner is in tests/pexpect_helper.py, in case you need to modify something there.
+
+These tests can be run via the tests/test_driver.py Python script, which will set up the environment.
 It sets up a temporary $HOME and also uses it as the current directory, so you do not need to create a temporary directory in them.
 
-If you need a command to do something weird to test something, maybe add it to the ``fish_test_helper`` binary (in tests/fish_test_helper.c), or see if it can already do it.
+If you need a command to do something weird to test something, maybe add it to the ``fish_test_helper`` binary (in ``tests/fish_test_helper.c``).
 
 Local testing
 -------------
 
-The tests can be run on your local computer on all operating systems.
+The tests can be run on your local system::
 
-::
-
-   cmake path/to/fish-shell
-   make fish_run_tests
-
-Or you can run them on a fish, without involving cmake::
-
-  cargo build
-  cargo test # for the unit tests
-  tests/test_driver.py target/debug # for the script and interactive tests
+    cargo build
+    # Run unit tests
+    cargo test
+    # Run system tests
+    tests/test_driver.py target/debug
+    # Run a specific system test.
+    tests/test_driver.py target/debug tests/checks/abbr.fish
 
 Here, the first argument to test_driver.py refers to a directory with ``fish``, ``fish_indent`` and ``fish_key_reader`` in it.
-In this example we're in the root of the git repo and have run ``cargo build`` without ``--release``, so it's a debug build.
+In this example we're in the root of the workspace and have run ``cargo build`` without ``--release``, so it's a debug build.
 
-Git hooks
----------
+To run all tests and linters, use::
 
-Since developers sometimes forget to run the tests, it can be helpful to
-use git hooks (see githooks(5)) to automate it.
-
-One possibility is a pre-push hook script like this one:
-
-.. code:: sh
-
-   #!/bin/sh
-   #### A pre-push hook for the fish-shell project
-   # This will run the tests when a push to master is detected, and will stop that if the tests fail
-   # Save this as .git/hooks/pre-push and make it executable
-
-   protected_branch='master'
-
-   # Git gives us lines like "refs/heads/frombranch SOMESHA1 refs/heads/tobranch SOMESHA1"
-   # We're only interested in the branches
-   while read from _ to _; do
-       if [ "x$to" = "xrefs/heads/$protected_branch" ]; then
-           isprotected=1
-       fi
-   done
-   if [ "x$isprotected" = x1 ]; then
-       echo "Running tests before push to master"
-       make fish_run_tests
-       RESULT=$?
-       if [ $RESULT -ne 0 ]; then
-           echo "Tests failed for a push to master, we can't let you do that" >&2
-           exit 1
-       fi
-   fi
-   exit 0
-
-This will check if the push is to the master branch and, if it is, only
-allow the push if running ``make fish_run_tests`` succeeds. In some circumstances
-it may be advisable to circumvent this check with
-``git push --no-verify``, but usually that isn’t necessary.
-
-To install the hook, place the code in a new file
-``.git/hooks/pre-push`` and make it executable.
-
-Coverity Scan
--------------
-
-We use Coverity’s static analysis tool which offers free access to open
-source projects. While access to the tool itself is restricted,
-fish-shell organization members should know that they can login
-`here <https://scan.coverity.com/projects/fish-shell-fish-shell?tab=overview>`__
-with their GitHub account. Currently, tests are triggered upon merging
-the ``master`` branch into ``coverity_scan_master``. Even if you are not
-a fish developer, you can keep an eye on our statistics there.
+    cargo xtask check
 
 Contributing Translations
 =========================
 
-Fish uses the GNU gettext library to translate messages from English to
-other languages.
+Fish uses GNU gettext to translate messages from English to other languages.
+We use custom tools for extracting messages from source files and to localize at runtime.
+This means that we do not have a runtime dependency on the gettext library.
+It also means that some features are not supported, such as message context and plurals.
+We also expect all files to be UTF-8-encoded.
+In practice, this should not matter much for contributing translations.
 
-Translation sources are
-stored in the ``po`` directory, named ``LANG.po``, where ``LANG`` is the
-two letter ISO 639-1 language code of the target language (e.g. ``de`` for
-German). A region specifier can also be used (e.g. ``pt_BR`` for Brazilian Portuguese).
+Translation sources are stored in the ``localization/po`` directory and named ``ll_CC.po``,
+where ``ll`` is the two (or possibly three) letter ISO 639-1 language code of the target language
+(e.g. ``pt`` for Portuguese). ``CC`` is an ISO 3166 country/territory code,
+(e.g. ``BR`` for Brazil).
+An example for a valid name is ``pt_BR.po``, indicating Brazilian Portuguese.
+These are the files you will interact with when adding translations.
 
 Adding translations for a new language
 --------------------------------------
 
 Creating new translations requires the Gettext tools.
-More specifically, you will need ``msguniq`` and ``msgmerge`` for creating translations for a new
-language.
-To create a new translation, run::
+More specifically, you will need ``msguniq``, ``msgmerge``, and ``msgattrib``
+for creating translations for a new language.
+To create a PO file for a new language ``ll_CC``, run::
 
-    build_tools/update_translations.fish po/LANG.po
+    cargo xtask gettext new ll_CC
 
-By default, this also creates ``mo`` files, which contain the information from the ``po`` files in a
-binary format.
-Fish uses these files for translating at runtime.
-They are not tracked in version control, but they can help translators check if their translations
-show up correctly.
-If you build fish locally (``cargo build``), and then run the resulting binary,
-it will make use of the ``mo`` files generated by the script.
-Use the ``LANG`` environment variable to tell fish which language to use, e.g.::
+This will create a new PO file in ``localization/po/``
+containing all messages available for translation.
+If the file already exists, it will be updated.
 
-  LANG=pt_BR.utf8 target/debug/fish
+After modifying a PO file, you can recompile fish, and it will integrate the modifications you made.
+This requires that the ``msgfmt`` utility is installed (comes as part of ``gettext``).
+It is important that the ``localize-messages`` cargo feature is enabled, which it is by default.
+You can explicitly enable it using::
 
-If you do not care about the ``mo`` files you can pass the ``--no-mo`` flag to the
-``update_translations.fish`` script.
+    cargo build --features=localize-messages
+
+Use environment variables to tell fish which language to use, e.g.::
+
+    LANG=pt_BR.utf8 fish
+
+or within the running fish shell::
+
+    set LANG pt_BR.utf8
+
+For more options regarding how to choose languages, see
+`the corresponding gettext documentation
+<https://www.gnu.org/software/gettext/manual/html_node/Locale-Environment-Variables.html>`__.
+One neat thing you can do is set a list of languages to check for translations in the order defined
+using the ``LANGUAGE`` variable, e.g.::
+
+    set LANGUAGE pt_BR de_DE
+
+to try to translate messages to Portuguese, if that fails try German, and if that fails too you will
+see the English version defined in the source code.
 
 Modifying existing translations
 -------------------------------
@@ -319,13 +313,8 @@ Modifying existing translations
 If you want to work on translations for a language which already has a corresponding ``po`` file, it
 is sufficient to edit this file. No other changes are necessary.
 
-To see your translations in action you can run::
-
-  build_tools/update_translations.fish --only-mo po/LANG.po
-
-to update the binary ``mo`` used by fish. Check the information for adding new languages for a
-description on how you can get fish to use these files.
-Running this script requires a fish executable and the gettext ``msgfmt`` tool.
+After recompiling fish, you should be able to see your translations in action. See the previous
+section for details.
 
 Editing PO files
 ----------------
@@ -333,20 +322,20 @@ Editing PO files
 Many tools are available for editing translation files, including
 command-line and graphical user interface programs. For simple use, you can use your text editor.
 
-Open up the po file, for example ``po/sv.po``, and you'll see something like::
+Open up the PO file, for example ``localization/po/sv.po``, and you'll see something like::
 
-  msgid "%ls: No suitable job\n"
-  msgstr ""
+    msgid "%s: No suitable job\n"
+    msgstr ""
 
 The ``msgid`` here is the "name" of the string to translate, typically the English string to translate.
 The second line (``msgstr``) is where your translation goes.
 
 For example::
 
-  msgid "%ls: No suitable job\n"
-  msgstr "%ls: Inget passande jobb\n"
+    msgid "%s: No suitable job\n"
+    msgstr "%s: Inget passande jobb\n"
 
-Any ``%s`` / ``%ls`` or ``%d`` are placeholders that fish will use for formatting at runtime. It is important that they match - the translated string should have the same placeholders in the same order.
+Any ``%s`` or ``%d`` are placeholders that fish will use for formatting at runtime. It is important that they match - the translated string should have the same placeholders in the same order.
 
 Also any escaped characters, like that ``\n`` newline at the end, should be kept so the translation has the same behavior.
 
@@ -359,10 +348,12 @@ Modifications to strings in source files
 ----------------------------------------
 
 If a string changes in the sources, the old translations will no longer work.
-They will be preserved in the ``po`` files, but commented-out (starting with ``#~``).
 If you add/remove/change a translatable strings in a source file,
-run ``build_tools/update_translations.fish`` to propagate this to all translation files (``po/*.po``).
+run ``cargo xtask gettext update`` to propagate this to all translation files (``localization/po/*.po``).
 This is only relevant for developers modifying the source files of fish or fish scripts.
+Note translations for messages which are no longer present in the sources will be deleted from the PO files.
+If the source string changed in a way which should not affect translations,
+consider updating the ``msgid`` in the PO files such that translations are preserved.
 
 Setting Code Up For Translations
 --------------------------------
@@ -373,7 +364,7 @@ macros:
 
 ::
 
-   streams.out.append(wgettext_fmt!("%ls: There are no jobs\n", argv[0]));
+    streams.out.append(wgettext_fmt!("%s: There are no jobs\n", argv[0]));
 
 All messages in fish script must be enclosed in single or double quote
 characters for our message extraction script to find them.
@@ -382,19 +373,25 @@ that the following are **not** valid:
 
 ::
 
-   echo (_ hello)
-   _ "goodbye"
+    echo (_ hello)
+    _ "goodbye"
 
 Above should be written like this instead:
 
 ::
 
-   echo (_ "hello")
-   echo (_ "goodbye")
+    echo (_ "hello")
+    echo (_ "goodbye")
 
 You can use either single or double quotes to enclose the
 message to be translated. You can also optionally include spaces after
 the opening parentheses or before the closing parentheses.
+
+Updating Dependencies
+=====================
+
+To update dependencies, run ``build_tools/update-dependencies.sh``.
+This currently requires `updatecli <https://github.com/updatecli/updatecli>`__ and a few other tools.
 
 Versioning
 ==========

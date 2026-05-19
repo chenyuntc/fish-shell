@@ -1,5 +1,3 @@
-.. _cmd-for:
-
 for - perform a set of commands multiple times
 ==============================================
 
@@ -25,7 +23,7 @@ Example
 ::
 
     for i in foo bar baz; echo $i; end
-    
+
     # would output:
     foo
     bar

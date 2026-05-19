@@ -1,10 +1,10 @@
 #RUN: %fish %s
 #REQUIRES: command -v tmux
 
-set -g isolated_tmux_fish_extra_args -C '
+isolated-tmux-start -C '
     function fish_prompt
         printf "prompt $status_generation> <status=$status> <$prompt_var> "
-        set prompt_var ''
+        set prompt_var ""
     end
     function on_prompt_var --on-variable prompt_var
         commandline -f repaint
@@ -15,15 +15,18 @@ set -g isolated_tmux_fish_extra_args -C '
     bind ctrl-g token-info
 '
 
-isolated-tmux-start
-
 isolated-tmux capture-pane -p
 # CHECK: prompt 0> <status=0> <>
 
-set -q CI && set sleep sleep 10
-set -U prompt_var changed
-tmux-sleep
-isolated-tmux send-keys Enter
+if __fish_is_cygwin
+    # See issue #12074
+    echo "prompt 0> <status=0> <changed>"
+else
+    set -q CI && set sleep sleep 10
+    set -U prompt_var changed
+    tmux-sleep
+    isolated-tmux send-keys Enter
+end
 # CHECK: prompt 0> <status=0> <changed>
 
 isolated-tmux send-keys echo Space 123
@@ -46,3 +49,45 @@ isolated-tmux capture-pane -p
 # CHECK: …<----------------------------------------------two-last-characters-rendered->!!
 # CHECK: test "
 # CHECK: indent"
+
+isolated-tmux send-keys C-c '
+    function fish_prompt
+        string repeat (math $COLUMNS) x
+    end
+' C-l 'echo hello'
+tmux-sleep
+isolated-tmux capture-pane -p
+# CHECK: xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+# CHECK: echo hello
+
+isolated-tmux send-keys C-c '
+    function fish_prompt
+        seq (math $LINES + 1)
+    end
+    function fish_right_prompt
+        echo test
+    end
+' Enter
+tmux-sleep
+isolated-tmux capture-pane -p -S -11
+# CHECK: 1
+# CHECK: 2
+# CHECK: 3
+# CHECK: 4
+# CHECK: 5
+# CHECK: 6
+# CHECK: 7
+# CHECK: 8
+# CHECK: 9
+# CHECK: 10
+# CHECK: 11                                                                          test
+# CHECK: 2
+# CHECK: 3
+# CHECK: 4
+# CHECK: 5
+# CHECK: 6
+# CHECK: 7
+# CHECK: 8
+# CHECK: 9
+# CHECK: 10
+# CHECK: 11                                                                          test

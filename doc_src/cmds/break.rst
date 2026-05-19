@@ -1,5 +1,3 @@
-.. _cmd-break:
-
 break - stop the current inner loop
 ===================================
 
@@ -19,7 +17,7 @@ Description
 
 ``break`` halts a currently running loop (*LOOP_CONSTRUCT*), such as a :doc:`for <for>` or :doc:`while <while>` loop. It is usually added inside of a conditional block such as an :doc:`if <if>` block.
 
-There are no parameters for ``break``.
+The **-h** or **--help** option displays help about using this command.
 
 Example
 -------

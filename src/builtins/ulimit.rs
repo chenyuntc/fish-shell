@@ -1,46 +1,125 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, sync::LazyLock};
 
-use libc::{c_uint, rlim_t, RLIM_INFINITY};
+use libc::{RLIM_INFINITY, c_uint, rlim_t};
 use nix::errno::Errno;
-use once_cell::sync::Lazy;
+use nix::sys::resource::Resource as ResourceEnum;
 
-use crate::fallback::{fish_wcswidth, wcscasecmp};
-use crate::libc::*;
-use crate::wutil::perror;
+use crate::{builtins::error::Error, err_fmt, err_raw, err_str, wutil::perror_nix};
+use fish_fallback::{fish_wcswidth, wcscasecmp};
 
 use super::prelude::*;
 
-/// Calls getrlimit.
-fn getrlimit(resource: c_uint) -> Option<(rlim_t, rlim_t)> {
+localizable_consts! {
+    BUILTIN_ULIMIT_UNLIMITED "unlimited"
+}
+
+pub mod limits {
+    /// Constants that exist everywhere (except perhaps Cygwin).
+    /// Note these are uints on Linux but ints everywhere else - we use -1 as a sentinel
+    /// so cast to int.
+    pub mod common {
+        use cfg_if::cfg_if;
+        use libc;
+        pub const CORE: libc::c_int = libc::RLIMIT_CORE as _;
+        pub const DATA: libc::c_int = libc::RLIMIT_DATA as _;
+        pub const FSIZE: libc::c_int = libc::RLIMIT_FSIZE as _;
+        cfg_if!(
+            if #[cfg(any(cygwin, target_os = "illumos"))] {
+                pub const MEMLOCK: libc::c_int = -1;
+            } else {
+                pub const MEMLOCK: libc::c_int = libc::RLIMIT_MEMLOCK as _;
+            }
+        );
+        pub const NOFILE: libc::c_int = libc::RLIMIT_NOFILE as _;
+        pub const STACK: libc::c_int = libc::RLIMIT_STACK as _;
+        pub const CPU: libc::c_int = libc::RLIMIT_CPU as _;
+        cfg_if!(
+            if #[cfg(any(cygwin, target_os = "illumos"))] {
+                pub const NPROC: libc::c_int = -1;
+            } else {
+                pub const NPROC: libc::c_int = libc::RLIMIT_NPROC as _;
+            }
+        );
+    }
+    pub use self::common::*;
+
+    // Define NAME as libc::LIBC_NAME on the listed OSes; -1 elsewhere.
+    macro_rules! define_on {
+        ($name:ident, $libc_name:ident; $($os:literal),+ $(,)?) => {
+            #[cfg(any($(target_os = $os),+))]
+            pub const $name: libc::c_int = libc::$libc_name as _;
+
+            #[cfg(not(any($(target_os = $os),+)))]
+            pub const $name: libc::c_int = -1;
+        };
+    }
+
+    define_on!(SIGPENDING, RLIMIT_SIGPENDING; "linux");
+    define_on!(MSGQUEUE, RLIMIT_MSGQUEUE; "linux");
+    define_on!(RTPRIO, RLIMIT_RTPRIO; "linux");
+    define_on!(RTTIME, RLIMIT_RTTIME; "linux");
+    define_on!(RSS, RLIMIT_RSS; "linux", "freebsd", "netbsd", "openbsd", "dragonfly");
+    // TODO(MSRV >= 1.86): target_os = "cygwin" triggers a warning on Rust 1.85.
+    #[cfg(any(
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        cygwin
+    ))]
+    pub const AS: libc::c_int = libc::RLIMIT_AS as _;
+    // TODO(MSRV >= 1.86): target_os = "cygwin" triggers a warning on Rust 1.85.
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "dragonfly",
+        cygwin
+    )))]
+    pub const AS: libc::c_int = -1;
+    define_on!(SBSIZE, RLIMIT_SBSIZE; "freebsd", "netbsd", "dragonfly");
+    define_on!(NICE, RLIMIT_NICE; "linux");
+    define_on!(KQUEUES, RLIMIT_KQUEUES; "freebsd");
+    define_on!(SWAP, RLIMIT_SWAP; "freebsd");
+    define_on!(NPTS, RLIMIT_NPTS; "freebsd");
+    define_on!(NTHR, RLIMIT_NTHR; "netbsd");
+}
+
+fn convert_resource(resource: c_uint) -> ResourceEnum {
     let resource: i32 = resource.try_into().unwrap();
 
-    // Resource is #[repr(i32)] so this is ok
-    let resource = unsafe { std::mem::transmute::<i32, nix::sys::resource::Resource>(resource) };
-    nix::sys::resource::getrlimit(resource)
-        .map_err(|_| perror("getrlimit"))
+    // SAFETY: Resource is #[repr(i32)] so this is sound
+    unsafe { std::mem::transmute(resource) }
+}
+
+/// Calls getrlimit.
+fn getrlimit(resource: c_uint) -> Option<(rlim_t, rlim_t)> {
+    nix::sys::resource::getrlimit(convert_resource(resource))
+        .map_err(|e| perror_nix("getrlimit", e))
         .ok()
 }
 
 fn setrlimit(resource: c_uint, rlim_cur: rlim_t, rlim_max: rlim_t) -> Result<(), Errno> {
-    let resource: i32 = resource.try_into().unwrap();
-    // Resource is #[repr(i32)] so this is ok
-    let resource = unsafe { std::mem::transmute::<i32, nix::sys::resource::Resource>(resource) };
-    nix::sys::resource::setrlimit(resource, rlim_cur, rlim_max)
+    nix::sys::resource::setrlimit(convert_resource(resource), rlim_cur, rlim_max)
 }
 
 /// Print the value of the specified resource limit.
 fn print(resource: c_uint, hard: bool, streams: &mut IoStreams) {
     let Some(l) = get(resource, hard) else {
-        streams.out.append(wgettext!("error\n"));
+        streams.out.appendln(wgettext!("error"));
         return;
     };
 
     if l == RLIM_INFINITY {
-        streams.out.append(wgettext!("unlimited\n"));
+        streams.out.appendln(wgettext!(BUILTIN_ULIMIT_UNLIMITED));
     } else {
         streams
             .out
-            .append(wgettext_fmt!("%lu\n", l / get_multiplier(resource)));
+            .appendln(&sprintf!("%u", l / get_multiplier(resource)));
     }
 }
 
@@ -49,7 +128,7 @@ fn print_all(hard: bool, streams: &mut IoStreams) {
     let mut w = 0;
 
     for resource in RESOURCE_ARR.iter() {
-        w = w.max(fish_wcswidth(resource.desc));
+        w = w.max(fish_wcswidth(resource.desc).unwrap_or_default());
     }
     for resource in RESOURCE_ARR.iter() {
         let Some((rlim_cur, rlim_max)) = getrlimit(resource.resource) else {
@@ -57,15 +136,15 @@ fn print_all(hard: bool, streams: &mut IoStreams) {
         };
         let l = if hard { rlim_max } else { rlim_cur };
 
-        let unit = if resource.resource == RLIMIT_CPU() as c_uint {
+        let unit = if resource.resource == limits::CPU as c_uint {
             "(seconds, "
         } else if get_multiplier(resource.resource) == 1 {
             "("
         } else {
             "(kB, "
         };
-        streams.out.append(sprintf!(
-            "%-*ls %10ls-%lc) ",
+        streams.out.append(&sprintf!(
+            "%-*s %10s-%c) ",
             w,
             resource.desc,
             unit,
@@ -73,12 +152,11 @@ fn print_all(hard: bool, streams: &mut IoStreams) {
         ));
 
         if l == RLIM_INFINITY {
-            streams.out.append(wgettext!("unlimited\n"));
+            streams.out.appendln(wgettext!(BUILTIN_ULIMIT_UNLIMITED));
         } else {
-            streams.out.append(wgettext_fmt!(
-                "%lu\n",
-                l / get_multiplier(resource.resource)
-            ));
+            streams
+                .out
+                .appendln(&sprintf!("%u", l / get_multiplier(resource.resource)));
         }
     }
 }
@@ -102,6 +180,8 @@ fn set_limit(
     value: rlim_t,
     streams: &mut IoStreams,
 ) -> BuiltinResult {
+    let cmd = L!("ulimit");
+
     let Some((mut rlim_cur, mut rlim_max)) = getrlimit(resource) else {
         return Err(STATUS_CMD_ERROR);
     };
@@ -119,12 +199,14 @@ fn set_limit(
 
     if let Err(errno) = setrlimit(resource, rlim_cur, rlim_max) {
         if errno == Errno::EPERM {
-            streams.err.append(wgettext_fmt!(
-                "ulimit: Permission denied when changing resource of type '%ls'\n",
+            err_fmt!(
+                "Permission denied when changing resource of type '%s'",
                 get_desc(resource)
-            ));
+            )
+            .cmd(cmd)
+            .finish(streams);
         } else {
-            builtin_wperror(L!("ulimit"), streams);
+            err_raw!(builtin_strerror()).cmd(cmd).finish(streams);
         }
 
         Err(STATUS_CMD_ERROR)
@@ -160,7 +242,7 @@ struct Options {
 impl Default for Options {
     fn default() -> Self {
         Options {
-            what: RLIMIT_FSIZE(),
+            what: limits::FSIZE,
             report_all: false,
             hard: false,
             soft: false,
@@ -168,10 +250,10 @@ impl Default for Options {
     }
 }
 
-pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+pub fn ulimit(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
     let cmd = args[0];
 
-    const SHORT_OPTS: &wstr = L!(":HSabcdefilmnqrstuvwyKPTh");
+    const SHORT_OPTS: &wstr = L!("HSabcdefilmnqrstuvwyKPTh");
 
     const LONG_OPTS: &[WOption] = &[
         wopt(L!("all"), ArgType::NoArgument, 'a'),
@@ -209,32 +291,43 @@ pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
             'a' => opts.report_all = true,
             'H' => opts.hard = true,
             'S' => opts.soft = true,
-            'b' => opts.what = RLIMIT_SBSIZE(),
-            'c' => opts.what = RLIMIT_CORE(),
-            'd' => opts.what = RLIMIT_DATA(),
-            'e' => opts.what = RLIMIT_NICE(),
-            'f' => opts.what = RLIMIT_FSIZE(),
-            'i' => opts.what = RLIMIT_SIGPENDING(),
-            'l' => opts.what = RLIMIT_MEMLOCK(),
-            'm' => opts.what = RLIMIT_RSS(),
-            'n' => opts.what = RLIMIT_NOFILE(),
-            'q' => opts.what = RLIMIT_MSGQUEUE(),
-            'r' => opts.what = RLIMIT_RTPRIO(),
-            's' => opts.what = RLIMIT_STACK(),
-            't' => opts.what = RLIMIT_CPU(),
-            'u' => opts.what = RLIMIT_NPROC(),
-            'v' => opts.what = RLIMIT_AS(),
-            'w' => opts.what = RLIMIT_SWAP(),
-            'y' => opts.what = RLIMIT_RTTIME(),
-            'K' => opts.what = RLIMIT_KQUEUES(),
-            'P' => opts.what = RLIMIT_NPTS(),
-            'T' => opts.what = RLIMIT_NTHR(),
+            'b' => opts.what = limits::SBSIZE,
+            'c' => opts.what = limits::CORE,
+            'd' => opts.what = limits::DATA,
+            'e' => opts.what = limits::NICE,
+            'f' => opts.what = limits::FSIZE,
+            'i' => opts.what = limits::SIGPENDING,
+            'l' => opts.what = limits::MEMLOCK,
+            'm' => opts.what = limits::RSS,
+            'n' => opts.what = limits::NOFILE,
+            'q' => opts.what = limits::MSGQUEUE,
+            'r' => opts.what = limits::RTPRIO,
+            's' => opts.what = limits::STACK,
+            't' => opts.what = limits::CPU,
+            'u' => opts.what = limits::NPROC,
+            'v' => opts.what = limits::AS,
+            'w' => opts.what = limits::SWAP,
+            'y' => opts.what = limits::RTTIME,
+            'K' => opts.what = limits::KQUEUES,
+            'P' => opts.what = limits::NPTS,
+            'T' => opts.what = limits::NTHR,
             'h' => {
                 builtin_print_help(parser, streams, cmd);
                 return Ok(SUCCESS);
             }
             ':' => {
-                builtin_missing_argument(parser, streams, cmd, w.argv[w.wopt_index - 1], true);
+                builtin_missing_argument(
+                    parser,
+                    streams,
+                    cmd,
+                    None,
+                    w.argv[w.wopt_index - 1],
+                    true,
+                );
+                return Err(STATUS_INVALID_ARGS);
+            }
+            ';' => {
+                builtin_unexpected_argument(parser, streams, cmd, w.argv[w.wopt_index - 1], true);
                 return Err(STATUS_INVALID_ARGS);
             }
             '?' => {
@@ -252,12 +345,10 @@ pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
     }
 
     if opts.what == -1 {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Resource limit not available on this operating system\n",
-            cmd
-        ));
-
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_str!("Resource limit not available on this operating system")
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
@@ -269,11 +360,10 @@ pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
         print(what, opts.hard, streams);
         return Ok(SUCCESS);
     } else if arg_count != 1 {
-        streams
-            .err
-            .append(wgettext_fmt!(BUILTIN_ERR_TOO_MANY_ARGUMENTS, cmd));
-
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_str!(Error::TOO_MANY_ARGUMENTS)
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     }
 
@@ -284,15 +374,12 @@ pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
         hard = true;
         soft = true;
     }
+    localizable_consts! {
+        BUILTIN_ULIMIT_INVALID "Invalid limit '%s'"
+    }
 
-    let new_limit: rlim_t = if w.wopt_index == argc {
-        streams.err.append(wgettext_fmt!(
-            "%ls: New limit cannot be an empty string\n",
-            cmd
-        ));
-        builtin_print_error_trailer(parser, streams.err, cmd);
-        return Err(STATUS_INVALID_ARGS);
-    } else if wcscasecmp(w.argv[w.wopt_index], L!("unlimited")) == Ordering::Equal {
+    let new_limit: rlim_t = if wcscasecmp(w.argv[w.wopt_index], L!("unlimited")) == Ordering::Equal
+    {
         RLIM_INFINITY
     } else if wcscasecmp(w.argv[w.wopt_index], L!("hard")) == Ordering::Equal {
         match get(what, true) {
@@ -306,22 +393,18 @@ pub fn ulimit(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
         }
     } else if let Ok(limit) = fish_wcstol(w.argv[w.wopt_index]) {
         let Some(x) = get_multiplier(what).checked_mul(limit as rlim_t) else {
-            streams.err.append(wgettext_fmt!(
-                "%ls: Invalid limit '%ls'\n",
-                cmd,
-                w.argv[w.wopt_index]
-            ));
-            builtin_print_error_trailer(parser, streams.err, cmd);
+            err_fmt!(BUILTIN_ULIMIT_INVALID, w.argv[w.wopt_index])
+                .cmd(cmd)
+                .full_trailer(parser)
+                .finish(streams);
             return Err(STATUS_INVALID_ARGS);
         };
         x
     } else {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Invalid limit '%ls'\n",
-            cmd,
-            w.argv[w.wopt_index]
-        ));
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_fmt!(BUILTIN_ULIMIT_INVALID, w.argv[w.wopt_index])
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return Err(STATUS_INVALID_ARGS);
     };
 
@@ -353,104 +436,99 @@ impl Resource {
 }
 
 /// Array of resource_t structs, describing all known resource types.
-static RESOURCE_ARR: Lazy<Box<[Resource]>> = Lazy::new(|| {
+static RESOURCE_ARR: LazyLock<Box<[Resource]>> = LazyLock::new(|| {
     let resources_info = [
         (
-            RLIMIT_SBSIZE(),
+            limits::SBSIZE,
             L!("Maximum size of socket buffers"),
             'b',
             1024,
         ),
         (
-            RLIMIT_CORE(),
+            limits::CORE,
             L!("Maximum size of core files created"),
             'c',
             1024,
         ),
         (
-            RLIMIT_DATA(),
+            limits::DATA,
             L!("Maximum size of a process’s data segment"),
             'd',
             1024,
         ),
+        (limits::NICE, L!("Control of maximum nice priority"), 'e', 1),
         (
-            RLIMIT_NICE(),
-            L!("Control of maximum nice priority"),
-            'e',
-            1,
-        ),
-        (
-            RLIMIT_FSIZE(),
+            limits::FSIZE,
             L!("Maximum size of files created by the shell"),
             'f',
             1024,
         ),
         (
-            RLIMIT_SIGPENDING(),
+            limits::SIGPENDING,
             L!("Maximum number of pending signals"),
             'i',
             1,
         ),
         (
-            RLIMIT_MEMLOCK(),
+            limits::MEMLOCK,
             L!("Maximum size that may be locked into memory"),
             'l',
             1024,
         ),
-        (RLIMIT_RSS(), L!("Maximum resident set size"), 'm', 1024),
+        (limits::RSS, L!("Maximum resident set size"), 'm', 1024),
         (
-            RLIMIT_NOFILE(),
+            limits::NOFILE,
             L!("Maximum number of open file descriptors"),
             'n',
             1,
         ),
         (
-            RLIMIT_MSGQUEUE(),
+            limits::MSGQUEUE,
             L!("Maximum bytes in POSIX message queues"),
             'q',
             1024,
         ),
         (
-            RLIMIT_RTPRIO(),
+            limits::RTPRIO,
             L!("Maximum realtime scheduling priority"),
             'r',
             1,
         ),
-        (RLIMIT_STACK(), L!("Maximum stack size"), 's', 1024),
+        (limits::STACK, L!("Maximum stack size"), 's', 1024),
         (
-            RLIMIT_CPU(),
+            limits::CPU,
             L!("Maximum amount of CPU time in seconds"),
             't',
             1,
         ),
         (
-            RLIMIT_NPROC(),
+            limits::NPROC,
             L!("Maximum number of processes available to current user"),
             'u',
             1,
         ),
         (
-            RLIMIT_AS(),
+            limits::AS,
             L!("Maximum amount of virtual memory available to each process"),
             'v',
             1024,
         ),
-        (RLIMIT_SWAP(), L!("Maximum swap space"), 'w', 1024),
+        (limits::SWAP, L!("Maximum swap space"), 'w', 1024),
         (
-            RLIMIT_RTTIME(),
+            limits::RTTIME,
             L!("Maximum contiguous realtime CPU time"),
             'y',
             1,
         ),
-        (RLIMIT_KQUEUES(), L!("Maximum number of kqueues"), 'K', 1),
+        (limits::KQUEUES, L!("Maximum number of kqueues"), 'K', 1),
         (
-            RLIMIT_NPTS(),
+            limits::NPTS,
             L!("Maximum number of pseudo-terminals"),
             'P',
             1,
         ),
         (
-            RLIMIT_NTHR(),
+            limits::NTHR,
             L!("Maximum number of simultaneous threads"),
             'T',
             1,

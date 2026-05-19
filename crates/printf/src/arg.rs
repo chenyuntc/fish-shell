@@ -15,7 +15,7 @@ pub enum Arg<'a> {
     #[cfg(feature = "widestring")]
     WString(WString),
     UInt(u64),
-    SInt(i64, u8), // signed integers track their width as the number of bits
+    SInt(i64),
     Float(f64),
     USizeRef(&'a mut usize), // for use with %n
 }
@@ -59,7 +59,7 @@ impl<'a> Arg<'a> {
     pub fn as_uint(&self) -> Result<u64, Error> {
         match *self {
             Arg::UInt(u) => Ok(u),
-            Arg::SInt(i, _w) => i.try_into().map_err(|_| Error::Overflow),
+            Arg::SInt(i) => i.try_into().map_err(|_| Error::Overflow),
             _ => Err(Error::BadArgType),
         }
     }
@@ -68,25 +68,18 @@ impl<'a> Arg<'a> {
     pub fn as_sint(&self) -> Result<i64, Error> {
         match *self {
             Arg::UInt(u) => u.try_into().map_err(|_| Error::Overflow),
-            Arg::SInt(i, _w) => Ok(i),
+            Arg::SInt(i) => Ok(i),
             _ => Err(Error::BadArgType),
         }
     }
 
-    // If this is a signed value, then return the sign (true if negative) and the magnitude,
-    // masked to the value's width. This allows for e.g. -1 to be returned as 0xFF, 0xFFFF, etc.
-    // depending on the original width.
-    // If this is an unsigned value, simply return (false, u64).
-    pub fn as_wrapping_sint(&self) -> Result<(bool, u64), Error> {
+    /// Unwraps [`Arg::UInt`] to [`u64`].
+    /// Unwraps [`Arg::SInt`] and casts the [`i64`] to [`u64`].
+    /// Calling this on other variants of `[Arg]` is an error.
+    pub fn as_wrapping_sint(&self) -> Result<u64, Error> {
         match *self {
-            Arg::UInt(u) => Ok((false, u)),
-            Arg::SInt(i, w) => {
-                // Need to shift twice in case w is 64.
-                debug_assert!(w > 0);
-                let mask = ((1u64 << (w - 1)) << 1).wrapping_sub(1);
-                let ui = (i as u64) & mask;
-                Ok((i < 0, ui))
-            }
+            Arg::UInt(u) => Ok(u),
+            Arg::SInt(i) => Ok(i as u64),
             _ => Err(Error::BadArgType),
         }
     }
@@ -97,7 +90,7 @@ impl<'a> Arg<'a> {
         match *self {
             Arg::Float(f) => Ok(f),
             Arg::UInt(u) => Ok(u as f64),
-            Arg::SInt(i, _w) => Ok(i as f64),
+            Arg::SInt(i) => Ok(i as f64),
             _ => Err(Error::BadArgType),
         }
     }
@@ -181,7 +174,7 @@ macro_rules! impl_to_arg {
         $(
             impl<'a> ToArg<'a> for $t {
                 fn to_arg(self) -> Arg<'a> {
-                    Arg::SInt(self as i64, <$t>::BITS as u8)
+                    Arg::SInt(self as i64)
                 }
             }
         )*
@@ -206,44 +199,43 @@ impl_to_arg_u!(u8, u16, u32, u64, usize);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use assert_matches::assert_matches;
     #[cfg(feature = "widestring")]
     use widestring::utf32str;
 
     #[test]
     fn test_to_arg() {
-        const SIZE_WIDTH: u8 = isize::BITS as u8;
-
-        assert!(matches!("test".to_arg(), Arg::Str("test")));
-        assert!(matches!(String::from("test").to_arg(), Arg::Str(_)));
+        assert_matches!("test".to_arg(), Arg::Str("test"));
+        assert_matches!(String::from("test").to_arg(), Arg::Str(_));
         #[cfg(feature = "widestring")]
-        assert!(matches!(utf32str!("test").to_arg(), Arg::WStr(_)));
+        assert_matches!(utf32str!("test").to_arg(), Arg::WStr(_));
         #[cfg(feature = "widestring")]
-        assert!(matches!(WString::from("test").to_arg(), Arg::WStr(_)));
-        assert!(matches!(42f32.to_arg(), Arg::Float(_)));
-        assert!(matches!(42f64.to_arg(), Arg::Float(_)));
-        assert!(matches!('x'.to_arg(), Arg::UInt(120)));
+        assert_matches!(WString::from("test").to_arg(), Arg::WStr(_));
+        assert_matches!(42f32.to_arg(), Arg::Float(_));
+        assert_matches!(42f64.to_arg(), Arg::Float(_));
+        assert_matches!('x'.to_arg(), Arg::UInt(120));
         let mut usize_val: usize = 0;
-        assert!(matches!((&mut usize_val).to_arg(), Arg::USizeRef(_)));
-        assert!(matches!(42i8.to_arg(), Arg::SInt(42, 8)));
-        assert!(matches!(42i16.to_arg(), Arg::SInt(42, 16)));
-        assert!(matches!(42i32.to_arg(), Arg::SInt(42, 32)));
-        assert!(matches!(42i64.to_arg(), Arg::SInt(42, 64)));
-        assert!(matches!(42isize.to_arg(), Arg::SInt(42, SIZE_WIDTH)));
+        assert_matches!((&mut usize_val).to_arg(), Arg::USizeRef(_));
+        assert_matches!(42i8.to_arg(), Arg::SInt(42));
+        assert_matches!(42i16.to_arg(), Arg::SInt(42));
+        assert_matches!(42i32.to_arg(), Arg::SInt(42));
+        assert_matches!(42i64.to_arg(), Arg::SInt(42));
+        assert_matches!(42isize.to_arg(), Arg::SInt(42));
 
-        assert_eq!((-42i8).to_arg(), Arg::SInt(-42, 8));
-        assert_eq!((-42i16).to_arg(), Arg::SInt(-42, 16));
-        assert_eq!((-42i32).to_arg(), Arg::SInt(-42, 32));
-        assert_eq!((-42i64).to_arg(), Arg::SInt(-42, 64));
-        assert_eq!((-42isize).to_arg(), Arg::SInt(-42, SIZE_WIDTH));
+        assert_eq!((-42i8).to_arg(), Arg::SInt(-42));
+        assert_eq!((-42i16).to_arg(), Arg::SInt(-42));
+        assert_eq!((-42i32).to_arg(), Arg::SInt(-42));
+        assert_eq!((-42i64).to_arg(), Arg::SInt(-42));
+        assert_eq!((-42isize).to_arg(), Arg::SInt(-42));
 
-        assert!(matches!(42u8.to_arg(), Arg::UInt(42)));
-        assert!(matches!(42u16.to_arg(), Arg::UInt(42)));
-        assert!(matches!(42u32.to_arg(), Arg::UInt(42)));
-        assert!(matches!(42u64.to_arg(), Arg::UInt(42)));
-        assert!(matches!(42usize.to_arg(), Arg::UInt(42)));
+        assert_matches!(42u8.to_arg(), Arg::UInt(42));
+        assert_matches!(42u16.to_arg(), Arg::UInt(42));
+        assert_matches!(42u32.to_arg(), Arg::UInt(42));
+        assert_matches!(42u64.to_arg(), Arg::UInt(42));
+        assert_matches!(42usize.to_arg(), Arg::UInt(42));
 
-        let ptr = &42f32 as *const f32;
-        assert!(matches!(ptr.to_arg(), Arg::UInt(_)));
+        let ptr = std::ptr::from_ref(&42f32);
+        assert_matches!(ptr.to_arg(), Arg::UInt(_));
     }
 
     #[test]

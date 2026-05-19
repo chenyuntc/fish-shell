@@ -14,11 +14,11 @@
 //! but it's still the best we can do because we don't know how long of a time might elapse between
 //! `TimerSnapshot` instances and need to avoid rollover.
 
-use std::fmt::Write as FmtWrite;
-use std::io::Write;
+use nix::sys::resource::{Usage, UsageWho, getrusage};
+use nix::sys::time::TimeVal;
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::time::{Duration, Instant};
-
-use crate::nix::{getrusage, RUsage};
 
 enum Unit {
     Minutes,
@@ -29,8 +29,8 @@ enum Unit {
 
 struct TimerSnapshot {
     wall_time: Instant,
-    cpu_fish: libc::rusage,
-    cpu_children: libc::rusage,
+    cpu_fish: Usage,
+    cpu_children: Usage,
 }
 
 /// Create a `TimerSnapshot` and return a `PrintElapsedOnDrop` object that will print upon
@@ -44,8 +44,11 @@ pub fn push_timer() -> PrintElapsedOnDrop {
 impl TimerSnapshot {
     pub fn take() -> TimerSnapshot {
         TimerSnapshot {
-            cpu_fish: getrusage(RUsage::RSelf),
-            cpu_children: getrusage(RUsage::RChildren),
+            // getrusage should never fail.
+            // POSIX rusage getrusage only fails if the who value is invalid. Both `RUSAGE_SELF` and
+            // `RUSAGE_CHILDREN` are valid, so this should never fail.
+            cpu_fish: getrusage(UsageWho::RUSAGE_SELF).unwrap(),
+            cpu_children: getrusage(UsageWho::RUSAGE_CHILDREN).unwrap(),
             wall_time: Instant::now(),
         }
     }
@@ -54,12 +57,17 @@ impl TimerSnapshot {
     /// instances. The returned string can take one of two formats, depending on the value of the
     /// `verbose` parameter.
     pub fn get_delta(t1: &TimerSnapshot, t2: &TimerSnapshot, verbose: bool) -> String {
-        use crate::nix::timeval_to_duration as from;
+        #[allow(clippy::unnecessary_cast)]
+        const fn from(val: TimeVal) -> Duration {
+            let micros = val.tv_sec() as i64 * 1_000_000 + val.tv_usec() as i64;
+            Duration::from_micros(micros as u64)
+        }
 
-        let mut fish_sys = from(&t2.cpu_fish.ru_stime) - from(&t1.cpu_fish.ru_stime);
-        let mut fish_usr = from(&t2.cpu_fish.ru_utime) - from(&t1.cpu_fish.ru_utime);
-        let mut child_sys = from(&t2.cpu_children.ru_stime) - from(&t1.cpu_children.ru_stime);
-        let mut child_usr = from(&t2.cpu_children.ru_utime) - from(&t1.cpu_children.ru_utime);
+        let mut fish_sys = from(t2.cpu_fish.system_time()) - from(t1.cpu_fish.system_time());
+        let mut fish_usr = from(t2.cpu_fish.user_time()) - from(t1.cpu_fish.user_time());
+        let mut child_sys =
+            from(t2.cpu_children.system_time()) - from(t1.cpu_children.system_time());
+        let mut child_usr = from(t2.cpu_children.user_time()) - from(t1.cpu_children.user_time());
 
         // The result from getrusage is not necessarily realtime, it may be cached from a few
         // microseconds ago. In the event that execution completes extremely quickly or there is
@@ -184,31 +192,49 @@ impl Unit {
     }
 }
 
-#[test]
-fn timer_format_and_alignment() {
-    let mut t1 = TimerSnapshot::take();
-    t1.cpu_fish.ru_utime.tv_usec = 0;
-    t1.cpu_fish.ru_stime.tv_usec = 0;
-    t1.cpu_children.ru_utime.tv_usec = 0;
-    t1.cpu_children.ru_stime.tv_usec = 0;
+#[cfg(test)]
+mod tests {
+    use super::TimerSnapshot;
+    use std::time::Duration;
 
-    let mut t2 = TimerSnapshot::take();
-    t2.cpu_fish.ru_utime.tv_usec = 999995;
-    t2.cpu_fish.ru_stime.tv_usec = 999994;
-    t2.cpu_children.ru_utime.tv_usec = 1000;
-    t2.cpu_children.ru_stime.tv_usec = 500;
-    t2.wall_time = t1.wall_time + Duration::from_micros(500);
+    #[test]
+    fn timer_format_and_alignment() {
+        let mut t1 = TimerSnapshot::take();
+        {
+            let t1_fish = t1.cpu_fish.as_mut();
+            t1_fish.ru_utime.tv_usec = 0;
+            t1_fish.ru_stime.tv_usec = 0;
+        }
+        {
+            let t1_children = t1.cpu_children.as_mut();
+            t1_children.ru_utime.tv_usec = 0;
+            t1_children.ru_stime.tv_usec = 0;
+        }
 
-    let expected = r#"
+        let mut t2 = TimerSnapshot::take();
+        {
+            let t2_fish = t2.cpu_fish.as_mut();
+            t2_fish.ru_utime.tv_usec = 999995;
+            t2_fish.ru_stime.tv_usec = 999994;
+        }
+        {
+            let t2_children = t2.cpu_children.as_mut();
+            t2_children.ru_utime.tv_usec = 1000;
+            t2_children.ru_stime.tv_usec = 500;
+        }
+        t2.wall_time = t1.wall_time + Duration::from_micros(500);
+
+        let expected = r#"
 ________________________________________________________
 Executed in  500.00 micros    fish         external
    usr time    1.00 secs      1.00 secs    1.00 millis
    sys time    1.00 secs      1.00 secs    0.50 millis
 "#;
-    //        (a)            (b)            (c)
-    // (a) remaining columns should align even if there are different units
-    // (b) carry to the next unit when it would overflow %6.2F
-    // (c) carry to the next unit when the larger one exceeds 1000
-    let actual = TimerSnapshot::get_delta(&t1, &t2, true);
-    assert_eq!(actual, expected);
+        //        (a)            (b)            (c)
+        // (a) remaining columns should align even if there are different units
+        // (b) carry to the next unit when it would overflow %6.2F
+        // (c) carry to the next unit when the larger one exceeds 1000
+        let actual = TimerSnapshot::get_delta(&t1, &t2, true);
+        assert_eq!(actual, expected);
+    }
 }

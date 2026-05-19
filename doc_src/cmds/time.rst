@@ -1,5 +1,3 @@
-.. _cmd-time:
-
 time - measure how long a command or block takes
 ================================================
 
@@ -57,7 +55,7 @@ Example
 ::
 
    >_ time sleep 1s
-   
+
    ________________________________________________________
    Executed in    1,01 secs   fish           external
       usr time    2,32 millis    0,00 micros    2,32 millis

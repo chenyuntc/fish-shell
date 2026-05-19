@@ -2,6 +2,8 @@
 
 use std::ops::ControlFlow;
 
+use crate::{builtins::error::Error, err_fmt, err_str};
+
 use super::prelude::*;
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -16,7 +18,7 @@ fn parse_options(
 ) -> ControlFlow<ErrorCode, (Options, usize)> {
     let cmd = args[0];
 
-    const SHORT_OPTS: &wstr = L!(":h");
+    const SHORT_OPTS: &wstr = L!("h");
     const LONG_OPTS: &[WOption] = &[wopt(L!("help"), ArgType::NoArgument, 'h')];
 
     let mut opts = Options::default();
@@ -27,7 +29,11 @@ fn parse_options(
         match c {
             'h' => opts.print_help = true,
             ':' => {
-                builtin_missing_argument(parser, streams, cmd, args[w.wopt_index - 1], true);
+                builtin_missing_argument(parser, streams, cmd, None, args[w.wopt_index - 1], true);
+                return ControlFlow::Break(STATUS_INVALID_ARGS);
+            }
+            ';' => {
+                builtin_unexpected_argument(parser, streams, cmd, args[w.wopt_index - 1], true);
                 return ControlFlow::Break(STATUS_INVALID_ARGS);
             }
             '?' => {
@@ -46,7 +52,7 @@ fn parse_options(
 }
 
 /// Function for handling the return builtin.
-pub fn r#return(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+pub fn r#return(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
     let mut retval = match parse_return_value(args, parser, streams) {
         ControlFlow::Continue(r) => r,
         ControlFlow::Break(result) => return result,
@@ -62,7 +68,7 @@ pub fn r#return(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) ->
     // Note in Rust, dividend % divisor has the same sign as the dividend.
     if retval < 0 {
         retval = 256 - (retval % 256).abs();
-    };
+    }
 
     let retval = BuiltinResult::from_dynamic(retval);
 
@@ -82,39 +88,33 @@ pub fn r#return(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) ->
 
 pub fn parse_return_value(
     args: &mut [&wstr],
-    parser: &Parser,
+    parser: &mut Parser,
     streams: &mut IoStreams,
 ) -> ControlFlow<BuiltinResult, i32> {
-    // TODO: use map_break <https://github.com/rust-lang/rust/issues/75744>
     let cmd = args[0];
-    let (opts, optind) = match parse_options(args, parser, streams) {
-        ControlFlow::Continue(o) => o,
-        ControlFlow::Break(error_code) => {
-            return ControlFlow::Break(BuiltinResult::Err(error_code))
-        }
-    };
+    let (opts, optind) = parse_options(args, parser, streams).map_break(BuiltinResult::Err)?;
 
     if opts.print_help {
         builtin_print_help(parser, streams, cmd);
         return ControlFlow::Break(Ok(SUCCESS));
     }
     if optind + 1 < args.len() {
-        streams
-            .err
-            .append(wgettext_fmt!(BUILTIN_ERR_TOO_MANY_ARGUMENTS, cmd));
-        builtin_print_error_trailer(parser, streams.err, cmd);
+        err_str!(Error::TOO_MANY_ARGUMENTS)
+            .cmd(cmd)
+            .full_trailer(parser)
+            .finish(streams);
         return ControlFlow::Break(Err(STATUS_INVALID_ARGS));
     }
     if optind == args.len() {
-        ControlFlow::Continue(parser.get_last_status())
+        ControlFlow::Continue(parser.last_status())
     } else {
         match fish_wcstoi(args[optind]) {
             Ok(i) => ControlFlow::Continue(i),
             Err(_e) => {
-                streams
-                    .err
-                    .append(wgettext_fmt!(BUILTIN_ERR_NOT_NUMBER, cmd, args[1]));
-                builtin_print_error_trailer(parser, streams.err, cmd);
+                err_fmt!(Error::NOT_NUMBER, args[1])
+                    .cmd(cmd)
+                    .full_trailer(parser)
+                    .finish(streams);
                 ControlFlow::Break(Err(STATUS_INVALID_ARGS))
             }
         }

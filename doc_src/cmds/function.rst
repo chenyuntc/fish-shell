@@ -1,5 +1,3 @@
-.. _cmd-function:
-
 function - create a function
 ============================
 
@@ -21,7 +19,7 @@ A function is a list of commands that will be executed when the name of the func
 The following options are available:
 
 **-a** *NAMES* or **--argument-names** *NAMES*
-    Has to be the last option. Assigns the value of successive command-line arguments to the names given in *NAMES* (separated by space). These are the same arguments given in :envvar:`argv`, and are still available there. See also :ref:`Argument Handling <variables-argv>`.
+    Assigns the value of successive command-line arguments to the names given in *NAMES* (separated by spaces). These are the same arguments given in :envvar:`argv`, and are still available there (unless ``--inherit-variable argv`` was used or one of the given *NAMES* is ``argv``). See also :ref:`Argument Handling <variables-argv>`.
 
 **-d** *DESCRIPTION* or **--description** *DESCRIPTION*
     A description of what the function does, suitable as a completion description.
@@ -40,7 +38,7 @@ The following options are available:
     Run this function when the variable *VARIABLE_NAME* changes value. Note that :program:`fish` makes no guarantees on any particular timing or even that the function will be run for every single ``set``. Rather it will be run when the variable has been set at least once, possibly skipping some values or being run when the variable has been set to the same value (except for universal variables set in other shells - only changes in the value will be picked up for those).
 
 **-j** *PID* or **--on-job-exit** *PID*
-    Run this function when the job containing a child process with the given process identifier *PID* exits. Instead of a PID, the string 'caller' can be specified. This is only allowed when in a command substitution, and will result in the handler being triggered by the exit of the job which created this command substitution.
+    Run this function when the job containing a child process with the given process ID *PID* exits. Instead of a PID, the string 'caller' can be specified. This is only allowed when in a command substitution, and will result in the handler being triggered by the exit of the job which created this command substitution.
     This will not trigger for :doc:`disowned <disown>` jobs.
 
 **-p** *PID* or **--on-process-exit** *PID*
@@ -61,6 +59,8 @@ The following options are available:
 The event handler switches (``on-event``, ``on-variable``, ``on-job-exit``, ``on-process-exit`` and ``on-signal``) cause a function to run automatically at specific events. New named events for ``--on-event`` can be fired using the :doc:`emit <emit>` builtin. Fish already generates a few events, see :ref:`event` for more.
 
 Functions names cannot be reserved words. These are elements of fish syntax or builtin commands which are essential for the operations of the shell. Current reserved words are ``[``, ``_``, ``and``, ``argparse``, ``begin``, ``break``, ``builtin``, ``case``, ``command``, ``continue``, ``else``, ``end``, ``eval``, ``exec``, ``for``, ``function``, ``if``, ``not``, ``or``, ``read``, ``return``, ``set``, ``status``, ``string``, ``switch``, ``test``, ``time``, and ``while``.
+
+Care should be taken when creating a function of the same name as an existing shell builtin or common program. If the function behaves differently, it is very common for problems to occur within fish or in scripts written by others. Consider writing an :doc:`abbreviation <abbr>` if you are wanting to replace one tool with another for interactive use.
 
 Example
 -------
@@ -87,7 +87,7 @@ will run the ``ls`` command, using the ``-l`` option, while passing on any addit
     # prints: [DEBUG] foo: bar
 
     # OR
-    
+
     function debug2 -a var
         echo [DEBUG] $var: $$var >&2
     end
@@ -108,7 +108,7 @@ will create a ``debug`` command to print chosen variables to `stderr`.
         if test $status = 0
             switch $argv[(count $argv)]
                 case '-*'
-    
+
                 case '*'
                     cd $argv[(count $argv)]
                     return
@@ -126,7 +126,7 @@ This will run the ``mkdir`` command, and if it is successful, change the current
     function notify
         set -l job (jobs -l -g)
         or begin; echo "There are no jobs" >&2; return 1; end
-    
+
         function _notify_job_$job --on-job-exit $job --inherit-variable job
             echo -n \a # beep
             functions -e _notify_job_$job

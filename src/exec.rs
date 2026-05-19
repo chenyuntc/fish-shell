@@ -4,70 +4,86 @@
 // performed have been massive.
 
 use crate::builtins::shared::{
-    builtin_run, ErrorCode, STATUS_CMD_ERROR, STATUS_CMD_UNKNOWN, STATUS_NOT_EXECUTABLE,
-    STATUS_READ_TOO_MUCH,
+    ErrorCode, STATUS_CMD_ERROR, STATUS_CMD_UNKNOWN, STATUS_NOT_EXECUTABLE, STATUS_READ_TOO_MUCH,
+    builtin_run,
 };
-use crate::common::{
-    exit_without_destructors, str2wcstring, truncate_at_nul, wcs2string, wcs2zstring, write_loop,
-    ScopeGuard,
-};
-use crate::env::{EnvMode, EnvStack, Environment, Statuses, READ_BYTE_LIMIT};
-#[cfg(FISH_USE_POSIX_SPAWN)]
+use crate::env::{EnvMode, EnvSetMode, EnvStack, Environment as _, READ_BYTE_LIMIT, Statuses};
+#[cfg(have_posix_spawn)]
 use crate::env_dispatch::use_posix_spawn;
-use crate::fds::make_fd_blocking;
-use crate::fds::{make_autoclose_pipes, open_cloexec, PIPE_ERROR};
-use crate::flog::{FLOG, FLOGF};
-use crate::fork_exec::blocked_signals_for_job;
-use crate::fork_exec::postfork::{
-    child_setup_process, execute_fork, execute_setpgid, report_setpgid_error,
-    safe_report_exec_error,
+use crate::fds::{
+    BorrowedFdFile, PIPE_ERROR, make_autoclose_pipes, make_fd_blocking, open_cloexec,
 };
-#[cfg(FISH_USE_POSIX_SPAWN)]
+use crate::flog::{flog, flogf};
+#[cfg(have_posix_spawn)]
 use crate::fork_exec::spawn::PosixSpawner;
+use crate::fork_exec::{
+    PATH_BSHELL, blocked_signals_for_job,
+    postfork::{
+        child_setup_process, execute_fork, execute_setpgid, report_setpgid_error,
+        signal_safe_report_exec_error,
+    },
+};
 use crate::function::{self, FunctionProperties};
 use crate::io::{
     BufferedOutputStream, FdOutputStream, IoBufferfill, IoChain, IoClose, IoMode, IoPipe,
     IoStreams, OutputStream, SeparatedBuffer, StringOutputStream,
 };
-use crate::libc::_PATH_BSHELL;
-use crate::nix::{getpid, isatty};
+use crate::nix::isatty;
 use crate::null_terminated_array::OwningNullTerminatedArray;
-use crate::parser::{Block, BlockId, BlockType, EvalRes, Parser};
-#[cfg(FISH_USE_POSIX_SPAWN)]
-use crate::proc::Pid;
+use crate::parser::{Block, BlockId, BlockType, EvalRes, Parser, ParserEnvSetMode};
+use crate::prelude::*;
 use crate::proc::{
-    hup_jobs, is_interactive_session, jobs_requiring_warning_on_exit, no_exec,
-    print_exit_warning_for_jobs, InternalProc, Job, JobGroupRef, ProcStatus, Process, ProcessType,
+    InternalProc, Job, JobGroupRef, Pid, ProcStatus, Process, ProcessType, hup_jobs,
+    is_interactive_session, jobs_requiring_warning_on_exit, no_exec, print_exit_warning_for_jobs,
 };
-use crate::reader::{reader_run_count, safe_restore_term_mode};
-use crate::redirection::{dup2_list_resolve_chain, Dup2List};
-use crate::threads::{iothread_perform_cant_wait, is_forked_child};
+use crate::reader::{reader_run_count, restore_term_mode};
+use crate::redirection::{Dup2List, dup2_list_resolve_chain};
+use crate::threads::{ThreadPool, is_forked_child};
 use crate::trace::trace_if_enabled_with_args;
 use crate::tty_handoff::TtyHandoff;
-use crate::wchar::prelude::*;
-use crate::wchar_ext::ToWString;
-use crate::wutil::{fish_wcstol, perror};
+use crate::wutil::{fish_wcstol, perror_io};
 use errno::{errno, set_errno};
+use fish_common::{ScopeGuard, exit_without_destructors, truncate_at_nul, write_loop};
+use fish_widestring::{ToWString as _, bytes2wcstring, wcs2bytes, wcs2zstring};
 use libc::{
     EACCES, ENOENT, ENOEXEC, ENOTDIR, EPIPE, EXIT_FAILURE, EXIT_SUCCESS, STDERR_FILENO,
     STDIN_FILENO, STDOUT_FILENO,
 };
-use nix::fcntl::OFlag;
-use nix::sys::stat;
-use std::ffi::CStr;
-use std::io::{Read, Write};
-use std::mem::MaybeUninit;
-use std::num::NonZeroU32;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::slice;
-use std::sync::atomic::Ordering;
-use std::sync::{atomic::AtomicUsize, Arc};
+use nix::{
+    fcntl::OFlag,
+    sys::stat,
+    unistd::{getpgrp, getpid},
+};
+use std::sync::LazyLock;
+use std::{
+    ffi::CStr,
+    io::{Read as _, Write as _},
+    mem::MaybeUninit,
+    num::NonZeroU32,
+    os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd, RawFd},
+    slice,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+};
+
+/// The singleton shared exec thread pool.
+/// This is used to write the output of internal processes (e.g. builtins)
+/// to their target fds.
+/// TODO: this IO could be multiplexed using FdMonitor.
+fn exec_thread_pool() -> &'static Arc<ThreadPool> {
+    // Use an unbounded queue because otherwise we risk deadlock.
+    static EXEC_THREAD_POOL: LazyLock<Arc<ThreadPool>> =
+        LazyLock::new(|| ThreadPool::new(1, usize::MAX));
+    &EXEC_THREAD_POOL
+}
 
 /// Execute the processes specified by `j` in the parser \p.
 /// On a true return, the job was successfully launched and the parser will take responsibility for
 /// cleaning it up. On a false return, the job could not be launched and the caller must clean it
 /// up.
-pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
+pub fn exec_job(parser: &mut Parser, job: &Job, block_io: IoChain) -> bool {
     // If fish was invoked with -n or --no-execute, then no_exec will be set and we do nothing.
     if no_exec() {
         return true;
@@ -85,14 +101,14 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
 
         // Apply foo=bar variable assignments
         for assignment in &job.processes()[0].variable_assignments {
-            parser.vars().set(
+            parser.set_var(
                 &assignment.variable_name,
-                EnvMode::LOCAL | EnvMode::EXPORT,
+                ParserEnvSetMode::new(EnvMode::LOCAL | EnvMode::EXPORT),
                 assignment.values.clone(),
             );
         }
 
-        internal_exec(parser.vars(), job, block_io);
+        internal_exec(parser.vars(), parser.is_repainting(), job, block_io);
         // internal_exec only returns if it failed to set up redirections.
         // In case of an successful exec, this code is not reached.
         let status = if job.flags().negate { 0 } else { 1 };
@@ -137,7 +153,7 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
         std::mem::swap(&mut proc_pipes.read, &mut pipe_next_read);
         if !p.is_last_in_job {
             let Ok(pipes) = make_autoclose_pipes() else {
-                FLOG!(warning, wgettext!(PIPE_ERROR));
+                flog!(warning, wgettext!(PIPE_ERROR));
                 aborted_pipeline = true;
                 abort_pipeline_from(job, i);
                 break;
@@ -199,7 +215,7 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
                 parser,
                 &job.processes()[dp],
                 job,
-                block_io,
+                block_io.clone(),
                 deferred_pipes,
                 &PartialPipes::default(),
                 true,
@@ -210,9 +226,9 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
         }
     }
 
-    FLOGF!(
+    flogf!(
         exec_job_exec,
-        "Executed job %d from command '%ls'",
+        "Executed job %d from command '%s'",
         job.job_id(),
         job.command()
     );
@@ -222,23 +238,24 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
     // If exec_error then a backgrounded job would have been terminated before it was ever assigned
     // a pgroup, so error out before setting last_pid.
     if !job.is_foreground() {
-        if let Some(last_pid) = job.get_last_pid() {
-            parser
-                .vars()
-                .set_one(L!("last_pid"), EnvMode::GLOBAL, last_pid.to_wstring());
+        if let Some(last_pid) = job.last_pid() {
+            parser.set_one(
+                L!("last_pid"),
+                ParserEnvSetMode::new(EnvMode::GLOBAL),
+                last_pid.to_wstring(),
+            );
         } else {
-            parser.vars().set_empty(L!("last_pid"), EnvMode::GLOBAL);
+            parser.set_empty(L!("last_pid"), ParserEnvSetMode::new(EnvMode::GLOBAL));
         }
     }
 
     if !job.is_initially_background() {
-        job.continue_job(parser);
+        job.continue_job(parser, Some(&block_io));
     }
 
     if job.is_stopped() {
         handoff.save_tty_modes();
     }
-    handoff.reclaim();
     true
 }
 
@@ -252,7 +269,7 @@ pub fn exec_job(parser: &Parser, job: &Job, block_io: IoChain) -> bool {
 /// Return a value appropriate for populating $status.
 pub fn exec_subshell(
     cmd: &wstr,
-    parser: &Parser,
+    parser: &mut Parser,
     outputs: Option<&mut Vec<WString>>,
     apply_exit_status: bool,
 ) -> Result<(), ErrorCode> {
@@ -274,7 +291,7 @@ pub fn exec_subshell(
 /// pgroup.
 pub fn exec_subshell_for_expand(
     cmd: &wstr,
-    parser: &Parser,
+    parser: &mut Parser,
     job_group: Option<&JobGroupRef>,
     outputs: &mut Vec<WString>,
 ) -> Result<(), ErrorCode> {
@@ -289,11 +306,7 @@ pub fn exec_subshell_for_expand(
         true,
     );
     // Only return an error code if we should break expansion.
-    if break_expand {
-        ret
-    } else {
-        Ok(())
-    }
+    if break_expand { ret } else { Ok(()) }
 }
 
 /// Number of calls to fork() or posix_spawn().
@@ -318,8 +331,8 @@ fn exit_code_from_exec_error(err: libc::c_int) -> libc::c_int {
             STATUS_NOT_EXECUTABLE
         }
         #[cfg(apple)]
-        libc::EBADARCH => {
-            // This is for e.g. running ARM app on Intel Mac.
+        libc::EBADARCH | libc::EBADMACHO => {
+            // This is for e.g. running ARM app on Intel Mac or a bad Mach-O executable
             STATUS_NOT_EXECUTABLE
         }
         _ => {
@@ -335,7 +348,7 @@ fn exit_code_from_exec_error(err: libc::c_int) -> libc::c_int {
 fn is_thompson_shell_payload(p: &[u8]) -> bool {
     if !p.contains(&b'\0') {
         return true;
-    };
+    }
     let mut haslower = false;
     for c in p {
         if c.is_ascii_lowercase() || *c == b'$' || *c == b'`' {
@@ -382,7 +395,7 @@ pub fn is_thompson_shell_script(path: &CStr) -> bool {
 /// This function is executed by the child process created by a call to fork(). It should be called
 /// after \c child_setup_process. It calls execve to replace the fish process image with the command
 /// specified in \c p. It never returns. Called in a forked child! Do not allocate memory, etc.
-fn safe_launch_process(
+fn signal_safe_launch_process(
     _p: &Process,
     actual_cmd: &CStr,
     argv: &OwningNullTerminatedArray,
@@ -401,25 +414,26 @@ fn safe_launch_process(
     if err.0 == ENOEXEC && is_thompson_shell_script(actual_cmd) {
         // Construct new argv.
         // We must not allocate memory, so only 128 args are supported.
-        const maxargs: usize = 128;
+        const MAXARGS: usize = 128;
         let nargs = argv.len();
         let argv = unsafe { slice::from_raw_parts(argv.get(), nargs) };
-        if nargs <= maxargs {
+        if nargs <= MAXARGS {
             // +1 for /bin/sh, +1 for terminating nullptr
-            let mut argv2 = [std::ptr::null(); 1 + maxargs + 1];
-            argv2[0] = _PATH_BSHELL.load(Ordering::Relaxed);
-            argv2[1..argv.len() + 1].copy_from_slice(argv);
+            let mut argv2 = [std::ptr::null(); 1 + MAXARGS + 1];
+            let bshell = PATH_BSHELL.as_ptr().cast();
+            argv2[0] = bshell;
+            argv2[1..=argv.len()].copy_from_slice(argv);
             // The command to call should use the full path,
             // not what we would pass as argv0.
             argv2[1] = actual_cmd.as_ptr();
             unsafe {
-                libc::execve(_PATH_BSHELL.load(Ordering::Relaxed), &argv2[0], envv.get());
+                libc::execve(bshell, &argv2[0], envv.get());
             }
         }
     }
 
     set_errno(err);
-    safe_report_exec_error(errno().0, actual_cmd, argv, envv);
+    signal_safe_report_exec_error(errno().0, actual_cmd, argv, envv);
     exit_without_destructors(exit_code_from_exec_error(err.0));
 }
 
@@ -437,9 +451,9 @@ fn launch_process_nofork(vars: &EnvStack, p: &Process) -> ! {
     let actual_cmd = wcs2zstring(&p.actual_cmd);
 
     // Ensure the terminal modes are what they were before we changed them.
-    safe_restore_term_mode();
+    restore_term_mode();
     // Bounce to launch_process. This never returns.
-    safe_launch_process(p, &actual_cmd, &argv, &envp);
+    signal_safe_launch_process(p, &actual_cmd, &argv, &envp);
 }
 
 // Returns whether we can use posix spawn for a given process in a given job.
@@ -447,7 +461,7 @@ fn launch_process_nofork(vars: &EnvStack, p: &Process) -> ! {
 // To avoid the race between the caller calling tcsetpgrp() and the client checking the
 // foreground process group, we don't use posix_spawn if we're going to foreground the process. (If
 // we use fork(), we can call tcsetpgrp after the fork, before the exec, and avoid the race).
-#[cfg(FISH_USE_POSIX_SPAWN)]
+#[cfg(have_posix_spawn)]
 fn can_use_posix_spawn_for_job(job: &Job, dup2s: &Dup2List) -> bool {
     // Is it globally disabled?
     if !use_posix_spawn() {
@@ -471,7 +485,7 @@ fn can_use_posix_spawn_for_job(job: &Job, dup2s: &Dup2List) -> bool {
     !wants_terminal
 }
 
-fn internal_exec(vars: &EnvStack, j: &Job, block_io: IoChain) {
+fn internal_exec(vars: &EnvStack, is_repainting: bool, j: &Job, block_io: IoChain) {
     // Do a regular launch -  but without forking first...
     let mut all_ios = block_io;
     if !all_ios.append_from_specs(j.processes()[0].redirection_specs(), &vars.get_pwd_slash()) {
@@ -500,7 +514,8 @@ fn internal_exec(vars: &EnvStack, j: &Job, block_io: IoChain) {
     {
         // Decrement SHLVL as we're removing ourselves from the shell "stack".
         if is_interactive_session() {
-            let shlvl_var = vars.getf(L!("SHLVL"), EnvMode::GLOBAL | EnvMode::EXPORT);
+            let global_exported_mode = EnvMode::GLOBAL | EnvMode::EXPORT;
+            let shlvl_var = vars.getf(L!("SHLVL"), global_exported_mode);
             let mut shlvl_str = L!("0").to_owned();
             if let Some(shlvl_var) = shlvl_var {
                 if let Ok(shlvl) = fish_wcstol(&shlvl_var.as_string()) {
@@ -509,7 +524,11 @@ fn internal_exec(vars: &EnvStack, j: &Job, block_io: IoChain) {
                     }
                 }
             }
-            vars.set_one(L!("SHLVL"), EnvMode::GLOBAL | EnvMode::EXPORT, shlvl_str);
+            vars.set_one(
+                L!("SHLVL"),
+                EnvSetMode::new(global_exported_mode, is_repainting),
+                shlvl_str,
+            );
         }
 
         // launch_process _never_ returns.
@@ -571,9 +590,9 @@ fn run_internal_process(p: &Process, outdata: Vec<u8>, errdata: Vec<u8>, ios: &I
         success_status: ProcStatus::default(),
     });
 
-    FLOGF!(
+    flogf!(
         proc_internal_proc,
-        "Created internal proc %llu to write output for proc '%ls'",
+        "Created internal proc %u to write output for proc '%s'",
         internal_proc.get_id(),
         p.argv0().unwrap()
     );
@@ -604,12 +623,12 @@ fn run_internal_process(p: &Process, outdata: Vec<u8>, errdata: Vec<u8>, ios: &I
     // builtin_run provide this directly, rather than setting it in the process.
     f.success_status = p.status();
 
-    iothread_perform_cant_wait(move || {
+    exec_thread_pool().perform(move || {
         let mut status = f.success_status;
         if !f.skip_out() {
             if let Err(err) = write_loop(&f.src_outfd, &f.outdata) {
                 if err.raw_os_error() != Some(EPIPE) {
-                    perror("write");
+                    perror_io("write", &err);
                 }
                 if status.is_success() {
                     status = ProcStatus::from_exit_code(1);
@@ -619,7 +638,7 @@ fn run_internal_process(p: &Process, outdata: Vec<u8>, errdata: Vec<u8>, ios: &I
         if !f.skip_err() {
             if let Err(err) = write_loop(&f.src_errfd, &f.errdata) {
                 if err.raw_os_error() != Some(EPIPE) {
-                    perror("write");
+                    perror_io("write", &err);
                 }
                 if status.is_success() {
                     status = ProcStatus::from_exit_code(1);
@@ -633,7 +652,7 @@ fn run_internal_process(p: &Process, outdata: Vec<u8>, errdata: Vec<u8>, ios: &I
 /// If `outdata` or `errdata` are both empty, then mark the process as completed immediately.
 /// Otherwise, run an internal process.
 fn run_internal_process_or_short_circuit(
-    parser: &Parser,
+    parser: &mut Parser,
     j: &Job,
     p: &Process,
     outdata: Vec<u8>,
@@ -643,21 +662,21 @@ fn run_internal_process_or_short_circuit(
     if outdata.is_empty() && errdata.is_empty() {
         p.completed.store(true);
         if p.is_last_in_job {
-            FLOGF!(
+            flogf!(
                 exec_job_status,
-                "Set status of job %d (%ls) to %d using short circuit",
+                "Set status of job %d (%s) to %d using short circuit",
                 j.job_id(),
                 j.preview(),
                 p.status().status_value()
             );
-            if let Some(statuses) = j.get_statuses() {
+            if let Some(statuses) = j.statuses() {
                 parser.set_last_statuses(statuses);
                 parser.libdata_mut().status_count += 1;
             } else if j.flags().negate {
                 // Special handling for `not set var (substitution)`.
                 // If there is no status, but negation was requested,
                 // take the last status and negate it.
-                let mut last_statuses = parser.get_last_statuses();
+                let mut last_statuses = parser.last_statuses();
                 last_statuses.status = if last_statuses.status == 0 { 1 } else { 0 };
                 parser.set_last_statuses(last_statuses);
             }
@@ -687,7 +706,7 @@ fn fork_child_for_process(
     // Claim the tty from fish, if the job wants it and we are the pgroup leader.
     let claim_tty_from = if p.leads_pgrp && job.group().wants_terminal() {
         // getpgrp(2) cannot fail and always returns the (positive) caller's pgid
-        Some(NonZeroU32::new(crate::nix::getpgrp() as u32).unwrap())
+        Some(NonZeroU32::new(getpgrp().as_raw() as u32).unwrap())
     } else {
         None
     };
@@ -718,7 +737,11 @@ fn fork_child_for_process(
 
     // Determine the child pid.
     let is_parent = fork_res > 0;
-    let pid: libc::pid_t = if is_parent { fork_res } else { getpid() };
+    let pid: libc::pid_t = if is_parent {
+        fork_res
+    } else {
+        getpid().as_raw()
+    };
 
     // Send the process to a new pgroup if requested.
     // Do this in BOTH the parent and child, to resolve the well-known race.
@@ -738,7 +761,7 @@ fn fork_child_for_process(
                 job_id,
                 &narrow_cmd,
                 &narrow_argv0,
-            )
+            );
         }
     }
 
@@ -750,15 +773,16 @@ fn fork_child_for_process(
     }
 
     // We are the parent. Record the pid and store the pgid for the job if it should lead the pgroup.
-    p.set_pid(Pid::new(pid).unwrap());
+    let pid = Pid::new(pid);
+    p.set_pid(pid);
     if matches!(pgroup_policy, PgroupPolicy::Lead) {
-        job.group().set_pgid(Pid::new(pid).unwrap());
+        job.group().set_pgid(pid);
     }
 
     let count = FORK_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    FLOGF!(
+    flogf!(
         exec_fork,
-        "Fork #%d, pid %d fork external command for '%ls'",
+        "Fork #%d, pid %d fork external command for '%s'",
         count,
         pid,
         p.argv0().unwrap()
@@ -781,21 +805,21 @@ fn create_output_stream_for_builtin(
         return OutputStream::Fd(FdOutputStream::new(fd));
     };
     match io.io_mode() {
-        IoMode::bufferfill => {
+        IoMode::BufferFill => {
             // Our IO redirection is to an internal buffer, e.g. a command substitution.
             // We will write directly to it.
             let buffer = io.as_bufferfill().unwrap().buffer();
             OutputStream::Buffered(BufferedOutputStream::new(buffer.clone()))
         }
-        IoMode::close => {
+        IoMode::Close => {
             // Like 'echo foo >&-'
             OutputStream::Null
         }
-        IoMode::file => {
+        IoMode::File => {
             // Output is to a file which has been opened.
             OutputStream::Fd(FdOutputStream::new(io.source_fd()))
         }
-        IoMode::pipe => {
+        IoMode::Pipe => {
             // Output is to a pipe. We may need to buffer.
             if piped_output_needs_buffering {
                 OutputStream::String(StringOutputStream::new())
@@ -803,7 +827,7 @@ fn create_output_stream_for_builtin(
                 OutputStream::Fd(FdOutputStream::new(io.source_fd()))
             }
         }
-        IoMode::fd => {
+        IoMode::Fd => {
             // This is a case like 'echo foo >&5'
             // It's uncommon and unclear what should happen.
             OutputStream::String(StringOutputStream::new())
@@ -814,7 +838,7 @@ fn create_output_stream_for_builtin(
 /// Handle output from a builtin, by printing the contents of builtin_io_streams to the redirections
 /// given in io_chain.
 fn handle_builtin_output(
-    parser: &Parser,
+    parser: &mut Parser,
     j: &Job,
     p: &Process,
     io_chain: &IoChain,
@@ -824,8 +848,8 @@ fn handle_builtin_output(
     assert!(p.is_builtin(), "Process is not a builtin");
 
     // Figure out any data remaining to write. We may have none, in which case we can short-circuit.
-    let outbuff = wcs2string(out.contents());
-    let errbuff = wcs2string(err.contents());
+    let outbuff = wcs2bytes(out.contents());
+    let errbuff = wcs2bytes(err.contents());
 
     // Some historical behavior.
     if !outbuff.is_empty() {
@@ -843,7 +867,7 @@ fn handle_builtin_output(
 /// An error return here indicates that the process failed to launch, and the rest of
 /// the pipeline should be cancelled.
 fn exec_external_command(
-    parser: &Parser,
+    parser: &mut Parser,
     j: &Job,
     p: &Process,
     proc_io_chain: &IoChain,
@@ -860,7 +884,7 @@ fn exec_external_command(
     // or we become the leader.
     let pgroup_policy = if p.leads_pgrp {
         PgroupPolicy::Lead
-    } else if let Some(pgid) = j.group().get_pgid() {
+    } else if let Some(pgid) = j.group().pgid() {
         PgroupPolicy::Join(pgid.as_pid_t())
     } else {
         PgroupPolicy::Inherit
@@ -874,10 +898,10 @@ fn exec_external_command(
 
     let actual_cmd = wcs2zstring(&p.actual_cmd);
 
-    #[cfg(FISH_USE_POSIX_SPAWN)]
+    #[cfg(have_posix_spawn)]
     // Prefer to use posix_spawn, since it's faster on some systems like OS X.
     if can_use_posix_spawn_for_job(j, &dup2s) {
-        let file = &parser.libdata().current_filename;
+        let file = parser.current_filename.borrow();
         let count = FORK_COUNT.fetch_add(1, Ordering::Relaxed) + 1; // spawn counts as a fork+exec
 
         let pid = PosixSpawner::new(j, pgroup_policy, &dup2s).and_then(|mut spawner| {
@@ -886,15 +910,15 @@ fn exec_external_command(
         let pid = match pid {
             Ok(pid) => pid,
             Err(err) => {
-                safe_report_exec_error(err.0, &actual_cmd, &argv, &envv);
+                signal_safe_report_exec_error(err.0, &actual_cmd, &argv, &envv);
                 p.status
                     .set(ProcStatus::from_exit_code(exit_code_from_exec_error(err.0)));
                 return Err(());
             }
         };
-        FLOGF!(
+        flogf!(
             exec_fork,
-            "Fork #%d, pid %d: spawn external command '%s' from '%ls'",
+            "Fork #%d, pid %d: spawn external command '%s' from '%s'",
             count,
             pid,
             p.actual_cmd,
@@ -904,27 +928,28 @@ fn exec_external_command(
         );
 
         // these are all things do_fork() takes care of normally (for forked processes):
-        p.set_pid(Pid::new(pid).unwrap());
+        let pid = Pid::new(pid);
+        p.set_pid(pid);
         if p.leads_pgrp {
-            j.group().set_pgid(Pid::new(pid).unwrap());
+            j.group().set_pgid(pid);
             // posix_spawn should in principle set the pgid before returning.
             // In glibc, posix_spawn uses fork() and the pgid group is set on the child side;
             // therefore the parent may not have seen it be set yet.
             // Ensure it gets set. See #4715, also https://github.com/Microsoft/WSL/issues/2997.
-            execute_setpgid(pid, pid, true /* is parent */);
+            execute_setpgid(pid.as_pid_t(), pid.as_pid_t(), true /* is parent */);
         }
         return Ok(());
     }
 
     fork_child_for_process(j, p, &dup2s, pgroup_policy, |p| {
-        safe_launch_process(p, &actual_cmd, &argv, &envv)
+        signal_safe_launch_process(p, &actual_cmd, &argv, &envv)
     })
 }
 
 // Given that we are about to execute a function, push a function block and set up the
 // variable environment.
 fn function_prepare_environment(
-    parser: &Parser,
+    parser: &mut Parser,
     mut argv: Vec<WString>,
     props: &FunctionProperties,
 ) -> BlockId {
@@ -947,24 +972,35 @@ fn function_prepare_environment(
     // 2. inherited variables
     // 3. argv
 
+    let mode = parser.convert_env_set_mode(ParserEnvSetMode::user(EnvMode::LOCAL));
+
+    let mut overwrite_argv = false;
     for (idx, named_arg) in props.named_arguments.iter().enumerate() {
+        if named_arg == L!("argv") {
+            overwrite_argv = true;
+        }
         if idx < argv.len() {
-            vars.set_one(named_arg, EnvMode::LOCAL | EnvMode::USER, argv[idx].clone());
+            vars.set_one(named_arg, mode, argv[idx].clone());
         } else {
-            vars.set_empty(named_arg, EnvMode::LOCAL | EnvMode::USER);
+            vars.set_empty(named_arg, mode);
         }
     }
 
     for (key, value) in &*props.inherit_vars {
-        vars.set(key, EnvMode::LOCAL | EnvMode::USER, value.clone());
+        if key == L!("argv") {
+            overwrite_argv = true;
+        }
+        vars.set(key, mode, value.clone());
     }
 
-    vars.set_argv(argv);
+    if !overwrite_argv {
+        vars.set_argv(argv, mode.is_repainting);
+    }
     fb
 }
 
 // Given that we are done executing a function, restore the environment.
-fn function_restore_environment(parser: &Parser, block: BlockId) {
+fn function_restore_environment(parser: &mut Parser, block: BlockId) {
     parser.pop_block(block);
 
     // If we returned due to a return statement, then stop returning now.
@@ -975,7 +1011,7 @@ fn function_restore_environment(parser: &Parser, block: BlockId) {
 // This accepts a place to execute as `parser` and then executes the result, returning a status.
 // This is factored out in this funny way in preparation for concurrent execution.
 type ProcPerformer =
-    dyn FnOnce(&Parser, Option<&mut OutputStream>, Option<&mut OutputStream>) -> ProcStatus;
+    dyn FnOnce(&mut Parser, Option<&mut OutputStream>, Option<&mut OutputStream>) -> ProcStatus;
 
 // Return a function which may be to run the given block node process 'p'.
 fn get_performer_for_block_node(p: &Process, job: &Job, io_chain: &IoChain) -> Box<ProcPerformer> {
@@ -987,9 +1023,9 @@ fn get_performer_for_block_node(p: &Process, job: &Job, io_chain: &IoChain) -> B
     let job_group = job.group.clone();
     let io_chain = io_chain.clone();
     let node = node.clone();
-    Box::new(move |parser: &Parser, _out, _err| {
+    Box::new(move |parser: &mut Parser, _out, _err| {
         parser
-            .eval_node(&node, &io_chain, job_group.as_ref(), BlockType::top)
+            .eval_node(&node, &io_chain, job_group.as_ref(), BlockType::Top, false)
             .status
     })
 }
@@ -1014,18 +1050,24 @@ fn get_performer_for_function(
     let io_chain = io_chain.clone();
     // This may occur if the function was erased as part of its arguments or in other strange edge cases.
     let Some(props) = function::get_props(p.argv0().unwrap()) else {
-        FLOG!(
+        flog!(
             error,
-            wgettext_fmt!("Unknown function '%ls'", p.argv0().unwrap())
+            wgettext_fmt!("Unknown function '%s'", p.argv0().unwrap())
         );
         return Err(());
     };
     let argv = p.argv().clone();
-    Ok(Box::new(move |parser: &Parser, _out, _err| {
+    Ok(Box::new(move |parser: &mut Parser, _out, _err| {
         // Pull out the job list from the function.
         let fb = function_prepare_environment(parser, argv, &props);
         let body_node = props.func_node.child_ref(|n| &n.jobs);
-        let mut res = parser.eval_node(&body_node, &io_chain, job_group.as_ref(), BlockType::top);
+        let mut res = parser.eval_node(
+            &body_node,
+            &io_chain,
+            job_group.as_ref(),
+            BlockType::Top,
+            false,
+        );
         function_restore_environment(parser, fb);
 
         // If the function did not execute anything, treat it as success.
@@ -1039,7 +1081,7 @@ fn get_performer_for_function(
 /// Execute a block node or function "process".
 /// `piped_output_needs_buffering` if true, buffer the output.
 fn exec_block_or_func_process(
-    parser: &Parser,
+    parser: &mut Parser,
     j: &Job,
     p: &Process,
     mut io_chain: IoChain,
@@ -1117,7 +1159,7 @@ fn get_performer_for_builtin(p: &Process, j: &Job, io_chain: &IoChain) -> Box<Pr
     // thread.
     let argv = p.argv().clone();
     Box::new(
-        move |parser: &Parser,
+        move |parser: &mut Parser,
               output_stream: Option<&mut OutputStream>,
               errput_stream: Option<&mut OutputStream>| {
             let output_stream = output_stream.unwrap();
@@ -1126,28 +1168,33 @@ fn get_performer_for_builtin(p: &Process, j: &Job, io_chain: &IoChain) -> Box<Pr
             let err_io = io_chain.io_for_fd(STDERR_FILENO);
 
             // Figure out what fd to use for the builtin's stdin.
-            let mut local_builtin_stdin = STDIN_FILENO;
+            let mut local_builtin_stdin = Some(BorrowedFdFile::stdin());
             if let Some(inp) = io_chain.io_for_fd(STDIN_FILENO) {
+                // An fd of -1 is treated as closing stdin.
                 // Ignore fd redirections from an fd other than the
                 // standard ones. e.g. in source <&3 don't actually read from fd 3,
                 // which is internal to fish. We still respect this redirection in
                 // that we pass it on as a block IO to the code that source runs,
                 // and therefore this is not an error.
-                let ignore_redirect = inp.io_mode() == IoMode::fd && inp.source_fd() >= 3;
-                if !ignore_redirect {
-                    local_builtin_stdin = inp.source_fd();
+                let fd = inp.source_fd();
+                let ignore_redirect = fd >= 3 && inp.io_mode() == IoMode::Fd;
+                if fd == -1 {
+                    local_builtin_stdin = None;
+                } else if !ignore_redirect {
+                    // Safety: the fd may in principal be closed, but this only panics on negative values.
+                    local_builtin_stdin = Some(unsafe { BorrowedFdFile::from_raw_fd(fd) });
                 }
             }
 
             // Populate our IoStreams. This is a bag of information for the builtin.
             let mut streams = IoStreams::new(output_stream, errput_stream, &io_chain);
             streams.job_group = job_group;
-            streams.stdin_fd = local_builtin_stdin;
+            streams.stdin_file = local_builtin_stdin;
             streams.stdin_is_directly_redirected = stdin_is_directly_redirected;
             streams.out_is_redirected = out_io.is_some();
             streams.err_is_redirected = err_io.is_some();
-            streams.out_is_piped = out_io.is_some_and(|io| io.io_mode() == IoMode::pipe);
-            streams.err_is_piped = err_io.is_some_and(|io| io.io_mode() == IoMode::pipe);
+            streams.out_is_piped = out_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
+            streams.err_is_piped = err_io.is_some_and(|io| io.io_mode() == IoMode::Pipe);
 
             // Disallow nul bytes in the arguments, as they are not allowed in builtins.
             let mut shim_argv: Vec<&wstr> =
@@ -1160,7 +1207,7 @@ fn get_performer_for_builtin(p: &Process, j: &Job, io_chain: &IoChain) -> Box<Pr
 
 /// Executes a builtin "process".
 fn exec_builtin_process(
-    parser: &Parser,
+    parser: &mut Parser,
     j: &Job,
     p: &Process,
     io_chain: &IoChain,
@@ -1195,7 +1242,7 @@ struct PartialPipes {
 /// An error return here indicates that the process failed to launch, and the rest of
 /// the pipeline should be cancelled.
 fn exec_process_in_job(
-    parser: &Parser,
+    parser: &mut Parser,
     p: &Process,
     j: &Job,
     block_io: IoChain,
@@ -1277,15 +1324,15 @@ fn exec_process_in_job(
     if !p.variable_assignments.is_empty() {
         block_id = Some(parser.push_block(Block::variable_assignment_block()));
     }
-    let _pop_block = ScopeGuard::new((), |()| {
+    let parser = &mut **ScopeGuard::new(parser, |parser| {
         if let Some(block_id) = block_id {
             parser.pop_block(block_id);
         }
     });
     for assignment in &p.variable_assignments {
-        parser.vars().set(
+        parser.set_var(
             &assignment.variable_name,
-            EnvMode::LOCAL | EnvMode::EXPORT,
+            ParserEnvSetMode::new(EnvMode::LOCAL | EnvMode::EXPORT),
             assignment.values.clone(),
         );
     }
@@ -1319,7 +1366,6 @@ fn exec_process_in_job(
             piped_output_needs_buffering,
         ),
         ProcessType::External => {
-            parser.libdata_mut().exec_external_count += 1;
             exec_external_command(parser, j, p, &process_net_io_chain)?;
             // It's possible (though unlikely) that this is a background process which recycled a
             // pid from another, previous background process. Forget any such old process.
@@ -1328,7 +1374,9 @@ fn exec_process_in_job(
         }
         ProcessType::Exec => {
             // We should have handled exec up above.
-            panic!("process_type_t::exec process found in pipeline, where it should never be. Aborting.");
+            panic!(
+                "process_type_t::exec process found in pipeline, where it should never be. Aborting."
+            );
         }
     }
 }
@@ -1361,7 +1409,7 @@ fn get_deferred_process(j: &Job) -> Option<usize> {
 }
 
 /// Given that we failed to execute process `failed_proc` in job `job`, mark that process and
-/// every subsequent process in the pipeline as aborted before launch.
+/// every subsequent process in the pipeline as aborted before launch.
 fn abort_pipeline_from(job: &Job, offset: usize) {
     for p in job.processes().iter().skip(offset) {
         p.mark_aborted_before_launch();
@@ -1371,7 +1419,7 @@ fn abort_pipeline_from(job: &Job, offset: usize) {
 // Given that we are about to execute an exec() call, check if the parser is interactive and there
 // are extant background jobs. If so, warn the user and do not exec().
 // Return true if we should allow exec, false to disallow it.
-fn allow_exec_with_background_jobs(parser: &Parser) -> bool {
+fn allow_exec_with_background_jobs(parser: &mut Parser) -> bool {
     // If we're not interactive, we cannot warn.
     if !parser.is_interactive() {
         return true;
@@ -1391,7 +1439,7 @@ fn allow_exec_with_background_jobs(parser: &Parser) -> bool {
         *last_exec_run_count = current_run_count;
         false
     } else {
-        hup_jobs(&parser.jobs());
+        hup_jobs(parser.jobs());
         true
     }
 }
@@ -1403,7 +1451,7 @@ fn populate_subshell_output(lst: &mut Vec<WString>, buffer: &SeparatedBuffer, sp
         let data = &elem.contents;
         if elem.is_explicitly_separated() {
             // Just append this one.
-            lst.push(str2wcstring(data));
+            lst.push(bytes2wcstring(data));
             continue;
         }
 
@@ -1419,9 +1467,9 @@ fn populate_subshell_output(lst: &mut Vec<WString>, buffer: &SeparatedBuffer, sp
                 let stop = data[cursor..].iter().position(|c| *c == b'\n');
                 let hit_separator = stop.is_some();
                 // If it's not found, just use the end.
-                let stop = stop.map(|rel| cursor + rel).unwrap_or(data.len());
+                let stop = stop.map_or(data.len(), |rel| cursor + rel);
                 // Stop now points at the first character we do not want to copy.
-                lst.push(str2wcstring(&data[cursor..stop]));
+                lst.push(bytes2wcstring(&data[cursor..stop]));
 
                 // If we hit a separator, skip over it; otherwise we're at the end.
                 cursor = stop + if hit_separator { 1 } else { 0 };
@@ -1429,7 +1477,7 @@ fn populate_subshell_output(lst: &mut Vec<WString>, buffer: &SeparatedBuffer, sp
         } else {
             // We're not splitting output, but we still want to trim off a trailing newline.
             let trailing_newline = if data.last() == Some(&b'\n') { 1 } else { 0 };
-            lst.push(str2wcstring(&data[..data.len() - trailing_newline]));
+            lst.push(bytes2wcstring(&data[..data.len() - trailing_newline]));
         }
     }
 }
@@ -1444,14 +1492,14 @@ fn populate_subshell_output(lst: &mut Vec<WString>, buffer: &SeparatedBuffer, sp
 /// of $status.
 fn exec_subshell_internal(
     cmd: &wstr,
-    parser: &Parser,
+    parser: &mut Parser,
     job_group: Option<&JobGroupRef>,
     lst: Option<&mut Vec<WString>>,
     break_expand: &mut bool,
     apply_exit_status: bool,
     is_subcmd: bool,
 ) -> Result<(), ErrorCode> {
-    let _scoped = parser.push_scope(|s| {
+    let _scoped = parser.push_scope(move |s| {
         s.is_subshell = true;
         s.read_limit = if is_subcmd {
             READ_BYTE_LIMIT.load(Ordering::Relaxed)
@@ -1460,8 +1508,8 @@ fn exec_subshell_internal(
         };
     });
 
-    let prev_statuses = parser.get_last_statuses();
-    let _put_back = ScopeGuard::new((), |()| {
+    let prev_statuses = parser.last_statuses();
+    let parser = &mut **ScopeGuard::new(parser, |parser| {
         if !apply_exit_status {
             parser.set_last_statuses(prev_statuses);
         }
@@ -1478,7 +1526,7 @@ fn exec_subshell_internal(
 
     let mut io_chain = IoChain::new();
     io_chain.push(bufferfill.clone());
-    let eval_res = parser.eval_with(cmd, &io_chain, job_group, BlockType::subst);
+    let eval_res = parser.eval_with(cmd, &io_chain, job_group, BlockType::Subst, false);
     let buffer = IoBufferfill::finish(bufferfill);
     if buffer.discarded() {
         *break_expand = true;

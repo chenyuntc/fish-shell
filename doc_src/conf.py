@@ -2,17 +2,27 @@
 #
 # Configuration file for the Sphinx documentation builder.
 #
-# This file does only contain a selection of the most common options. For a
-# full list see the documentation:
-# http://www.sphinx-doc.org/en/master/config
+# This file only contains a selection of the most common options. For a full
+# list see the documentation:
+# https://www.sphinx-doc.org/en/master/usage/configuration.html
 
-import glob
+from glob import glob
 import os.path
 import subprocess
 import sys
+from pathlib import Path
 from sphinx.highlighting import lexers
 from sphinx.errors import SphinxWarning
 from docutils import nodes
+
+try:
+    import sphinx_markdown_builder
+
+    extensions = [
+        "sphinx_markdown_builder",
+    ]
+except ImportError:
+    pass
 
 # -- Helper functions --------------------------------------------------------
 
@@ -36,8 +46,39 @@ def issue_role(name, rawtext, text, lineno, inliner, options=None, content=None)
     return [link], []
 
 
-def do_not_use_fish_indent_for_man(app):
-    if app.builder.name == "man":
+def extract_sections(app, env):
+    if app.builder.name != "man":
+        return
+    output_file = app.config.fish_help_sections_output
+    if output_file == "":
+        return
+
+    import re
+
+    sections = []
+    for docname, info in env.tocs.items():
+        for node in info.traverse():
+            if not isinstance(node, nodes.reference):
+                continue
+            anchor = node["anchorname"]
+            if re.match(r"^#id\d+$", anchor):
+                continue
+            if anchor and docname.startswith("cmds/"):
+                continue
+            if anchor and docname == "relnotes":
+                continue
+            sections.append(docname + anchor)
+    sections.sort()
+    for section in sections:
+        assert re.match(r"[\w-]", section), (
+            f"Unsupported characters in section path: {section}"
+        )
+    help_sections = "".join(f"{section}\n" for section in sections)
+    Path(output_file).write_text(help_sections)
+
+
+def remove_fish_indent_lexer(app):
+    if app.builder.name in ("man", "markdown"):
         del lexers["fish-docs-samples"]
 
 
@@ -54,9 +95,16 @@ def setup(app):
     app.add_directive("synopsis", FishSynopsisDirective)
 
     app.add_config_value("issue_url", default=None, rebuild="html")
+    app.add_config_value(
+        "fish_help_sections_output",
+        default="",
+        rebuild="man",
+        types=str,
+    )
     app.add_role("issue", issue_role)
 
-    app.connect("builder-inited", do_not_use_fish_indent_for_man)
+    app.connect("builder-inited", remove_fish_indent_lexer)
+    app.connect("env-updated", extract_sections)
 
 
 # The default language to assume
@@ -69,17 +117,10 @@ copyright = "fish-shell developers"
 author = "fish-shell developers"
 issue_url = "https://github.com/fish-shell/fish-shell/issues"
 
-# Parsing FISH-BUILD-VERSION-FILE is possible but hard to ensure that it is in the right place
-# fish_indent is guaranteed to be on PATH for the Pygments highlighter anyway
-if "FISH_BUILD_VERSION_FILE" in os.environ:
-    f = open(os.environ["FISH_BUILD_VERSION_FILE"], "r")
-    ret = f.readline().strip()
-elif "FISH_BUILD_VERSION" in os.environ:
-    ret = os.environ["FISH_BUILD_VERSION"]
-else:
-    ret = subprocess.check_output(
-        ("../build_tools/git_version_gen.sh", "--stdout"), stderr=subprocess.STDOUT
-    ).decode("utf-8")
+# From Cargo, or no build system.
+ret = subprocess.check_output(
+    ("../build_tools/git_version_gen.sh"), stderr=subprocess.STDOUT
+).decode("utf-8")
 
 # The full version, including alpha/beta/rc tags
 release = ret.strip().split(" ")[-1]
@@ -110,7 +151,8 @@ language = "en"
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = []
+fish_exclude_patterns = "cmds/*.inc.rst"
+exclude_patterns = [fish_exclude_patterns]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = None
@@ -176,7 +218,7 @@ latex_engine = "xelatex"
 
 def get_command_description(path, name):
     """Return the description for a command, by parsing its synopsis line"""
-    with open(path) as opened:
+    with open(path, encoding="utf8") as opened:
         for line in opened:
             if line.startswith(name + " - "):
                 _, desc = line.split(" - ", 1)
@@ -213,7 +255,7 @@ man_pages = [
     ),
     ("faq", "fish-faq", "", [author], 1),
 ]
-for path in sorted(glob.glob("cmds/*")):
+for path in sorted(set(glob("cmds/*.rst")) - set(glob(fish_exclude_patterns))):
     docname = os.path.splitext(path)[0]
     cmd = os.path.basename(docname)
     man_pages.append((docname, cmd, get_command_description(path, cmd), "", 1))

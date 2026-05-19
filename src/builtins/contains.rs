@@ -1,3 +1,5 @@
+use crate::err_str;
+
 // Implementation of the contains builtin.
 use super::prelude::*;
 
@@ -14,7 +16,7 @@ fn parse_options(
 ) -> Result<(Options, usize), ErrorCode> {
     let cmd = args[0];
 
-    const SHORT_OPTS: &wstr = L!("+:hi");
+    const SHORT_OPTS: &wstr = L!("+hi");
     const LONG_OPTS: &[WOption] = &[
         wopt(L!("help"), ArgType::NoArgument, 'h'),
         wopt(L!("index"), ArgType::NoArgument, 'i'),
@@ -28,7 +30,11 @@ fn parse_options(
             'h' => opts.print_help = true,
             'i' => opts.print_index = true,
             ':' => {
-                builtin_missing_argument(parser, streams, cmd, args[w.wopt_index - 1], false);
+                builtin_missing_argument(parser, streams, cmd, None, args[w.wopt_index - 1], false);
+                return Err(STATUS_INVALID_ARGS);
+            }
+            ';' => {
+                builtin_unexpected_argument(parser, streams, cmd, args[w.wopt_index - 1], false);
                 return Err(STATUS_INVALID_ARGS);
             }
             '?' => {
@@ -46,7 +52,7 @@ fn parse_options(
 
 /// Implementation of the builtin contains command, used to check if a specified string is part of
 /// a list.
-pub fn contains(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+pub fn contains(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
     let cmd = args[0];
 
     let (opts, optind) = parse_options(args, parser, streams)?;
@@ -61,16 +67,14 @@ pub fn contains(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) ->
         for (i, arg) in args[optind..].iter().enumerate().skip(1) {
             if needle == arg {
                 if opts.print_index {
-                    streams.out.appendln(i.to_wstring());
+                    streams.out.appendln(&i.to_wstring());
                 }
                 return Ok(SUCCESS);
             }
         }
     } else {
-        streams
-            .err
-            .append(wgettext_fmt!("%ls: Key not specified\n", cmd));
+        err_str!("Key not specified").cmd(cmd).finish(streams);
     }
 
-    return Err(STATUS_CMD_ERROR);
+    Err(STATUS_CMD_ERROR)
 }

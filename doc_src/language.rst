@@ -1,12 +1,9 @@
-
-.. _language:
-
 The fish language
 =================
 
 This document is a comprehensive overview of fish's scripting language.
 
-For interactive features see :ref:`Interactive use <interactive>`.
+For interactive features see :doc:`Interactive use <interactive>`.
 
 .. _syntax:
 
@@ -40,8 +37,6 @@ A switch is a very common special type of argument. Switches almost always start
 Switches differ between commands and are usually documented on a command's manual page. There are some switches, however, that are common to most commands. For example, ``--help`` will usually display a help text, ``--version`` will usually display the command version, and ``-i`` will often turn on interactive prompting before taking action. Try ``man your-command-here`` to get information on your command's switches.
 
 So the basic idea of fish is the same as with other unix shells: It gets a commandline, runs :ref:`expansions <expand>`, and the result is then run as a command.
-
-.. _terminology:
 
 Terminology
 -----------
@@ -181,7 +176,7 @@ The destination of a stream can be changed using something called *redirection*.
 - An ampersand (``&``) followed by the number of another file descriptor like ``&2`` for standard error. The output will be written to the destination descriptor.
 - An ampersand followed by a minus sign (``&-``). The file descriptor will be closed. Note: This may cause the program to fail because its writes will be unsuccessful.
 
-As a convenience, the redirection ``&>`` can be used to direct both stdout and stderr to the same destination. For example, ``echo hello &> all_output.txt`` redirects both stdout and stderr to the file ``all_output.txt``. This is equivalent to ``echo hello > all_output.txt 2>&1``.
+As a convenience, the redirection ``&>`` can be used to direct both stdout and stderr to the same destination. For example, ``echo hello &> all_output.txt`` redirects both stdout and stderr to the file ``all_output.txt``. This is equivalent to ``echo hello > all_output.txt 2>&1``.  You can also use ``&>>`` to append both stdout and stderr to the same destination.
 
 Any arbitrary file descriptor can be used in a redirection by prefixing the redirection with the FD number.
 
@@ -240,7 +235,7 @@ It is possible to pipe a different output file descriptor by prepending its FD n
 
 will attempt to build ``fish``, and any errors will be shown using the ``less`` pager. [#]_
 
-As a convenience, the pipe ``&|`` redirects both stdout and stderr to the same process. This is different from bash, which uses ``|&``.
+As a convenience, the pipe ``&|`` (as well as the ``|&`` alias which is also supported by Bash) both redirect stdout and stderr to the same process.
 
 .. [#] A "pager" here is a program that takes output and "paginates" it. ``less`` doesn't just do pages, it allows arbitrary scrolling (even back!).
 
@@ -381,7 +376,6 @@ By default ``$fish_function_path`` contains the following:
 - A directory for users to keep their own functions, usually ``~/.config/fish/functions`` (controlled by the ``XDG_CONFIG_HOME`` environment variable).
 - A directory for functions for all users on the system, usually ``/etc/fish/functions`` (really ``$__fish_sysconfdir/functions``).
 - Directories for other software to put their own functions. These are in the directories under ``$__fish_user_data_dir`` (usually ``~/.local/share/fish``, controlled by the ``XDG_DATA_HOME`` environment variable) and in the ``XDG_DATA_DIRS`` environment variable, in a subdirectory called ``fish/vendor_functions.d``. The default value for ``XDG_DATA_DIRS`` is usually ``/usr/share/fish/vendor_functions.d`` and ``/usr/local/share/fish/vendor_functions.d``.
-- The functions shipped with fish, usually installed in ``/usr/share/fish/functions`` (really ``$__fish_data_dir/functions``).
 
 If you are unsure, your functions probably belong in ``~/.config/fish/functions``.
 
@@ -917,7 +911,7 @@ If there is nothing between a brace and a comma or two commas, it's interpreted 
 
 To use a "," as an element, :ref:`quote <quotes>` or :ref:`escape <escapes>` it.
 
-The very first character of a command token is never interpreted as expanding brace, because it's the beginning of a :ref:`compound statement <cmd-begin>`::
+The very first character of a command token is never interpreted as expanding brace, because it's the beginning of a :doc:`compound statement <cmds/begin>`::
 
     > {echo hello, && echo world}
     hello,
@@ -1086,8 +1080,6 @@ The ``~`` (tilde) character at the beginning of a parameter, followed by a usern
 
   echo ~root # prints root's home directory, probably "/root"
 
-.. _combine:
-
 Combining different expansions
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -1186,7 +1178,7 @@ All variables in fish have a scope. For example they can be global or local to a
 
   echo $name, I am $place and my instrument is $instrument
   # Will print:
-  # Patrick, I am at the Krusty Krab and my instrument is 
+  # Patrick, I am at the Krusty Krab and my instrument is
 
 There are four kinds of variable scopes in fish: universal, global, function and local variables.
 
@@ -1242,11 +1234,6 @@ If you want to set something in config.fish, or set something in a function and 
 
     # Set my language
     set -gx LANG de_DE.UTF-8
-
-If you want to set some personal customization, universal variables are nice::
-
-     # Typically you'd run this interactively, fish takes care of keeping it.
-     set -U fish_color_autosuggestion 555
 
 Here is an example of local vs function-scoped variables::
 
@@ -1325,9 +1312,8 @@ This syntax is supported since fish 3.1.
 Universal Variables
 ^^^^^^^^^^^^^^^^^^^
 
-Universal variables are variables that are shared between all the user's fish sessions on the computer. Fish stores many of its configuration options as universal variables. This means that in order to change fish settings, all you have to do is change the variable value once, and it will be automatically updated for all sessions, and preserved across computer reboots and login/logout.
-
-To see universal variables in action, start two fish sessions side by side, and issue the following command in one of them ``set fish_color_cwd blue``. Since ``fish_color_cwd`` is a universal variable, the color of the current working directory listing in the prompt will instantly change to blue on both terminals.
+Universal variables are variables that are shared between all the user's fish sessions on the computer.
+All changes to universal variables are persistent and instantly propagated across fish sessions.
 
 :ref:`Universal variables <variables-universal>` are stored in the file ``.config/fish/fish_variables``. Do not edit this file directly, as your edits may be overwritten. Edit the variables through fish scripts or by using fish interactively instead.
 
@@ -1519,7 +1505,7 @@ For more information on argparse, like how to handle option arguments, see :doc:
 PATH variables
 ^^^^^^^^^^^^^^
 
-Path variables are a special kind of variable used to support colon-delimited path lists including :envvar:`PATH`, :envvar:`CDPATH`, :envvar:`MANPATH`, :envvar:`PYTHONPATH`, etc. All variables that end in "PATH" (case-sensitive) become PATH variables by default.
+Path variables are a special kind of variable used to support colon-delimited path lists including :envvar:`PATH`, :envvar:`CDPATH`, :envvar:`MANPATH`, :envvar:`PYTHONPATH`, :envvar:`LANGUAGE` (for :doc:`localization <cmds/_>`) etc. All variables that end in "PATH" (case-sensitive) become PATH variables by default.
 
 PATH variables act as normal lists, except they are implicitly joined and split on colons.
 
@@ -1563,7 +1549,8 @@ You can change the settings of fish by changing the values of certain variables.
 
 .. describe:: Locale Variables
 
-   The locale variables :envvar:`LANG`, :envvar:`LC_ALL`, :envvar:`LC_COLLATE`, :envvar:`LC_CTYPE`, :envvar:`LC_MESSAGES`, :envvar:`LC_MONETARY`, :envvar:`LC_NUMERIC`, and :envvar:`LANG` set the language option for the shell and subprograms. See the section :ref:`Locale variables <variables-locale>` for more information.
+   Locale variables such as :envvar:`LANG`, :envvar:`LC_ALL`, :envvar:`LC_MESSAGES`, :envvar:`LC_NUMERIC` and :envvar:`LC_TIME` set the language option for the shell and subprograms.
+   See the section :ref:`Locale variables <variables-locale>` and :ref:`status language <status-language>` for more information.
 
 .. describe:: Color variables
 
@@ -1572,11 +1559,13 @@ You can change the settings of fish by changing the values of certain variables.
 .. envvar:: fish_term24bit
 
    If this is set to 0, fish will not output 24-bit RGB true-color sequences but the nearest color on the 256 color palette (or the 16 color palette, if :envvar:`fish_term256` is 0).
+   See also :doc:`set_color <cmds/set_color>`.
+   The default is 1 but for historical reasons, fish defaults to behaving as if it was 0 on some terminals that are known to not support true-color sequences.
 
 .. envvar:: fish_term256
 
    If this is set to 0 and :envvar:`fish_term24bit` is 0, translate RGB colors down to the 16 color palette.
-   Also, if this is set to 0, :doc:`set_color <cmds/set_color>`/` commands such as ``set_color ff0000 red`` will prefer the named color.
+   Also, if this is set to 0, :doc:`set_color <cmds/set_color>` commands such as ``set_color ff0000 red`` will prefer the named color.
 
 .. envvar:: fish_ambiguous_width
 
@@ -1584,7 +1573,7 @@ You can change the settings of fish by changing the values of certain variables.
 
 .. envvar:: fish_emoji_width
 
-   controls whether fish assumes emoji render as 2 cells or 1 cell wide. This is necessary because the correct value changed from 1 to 2 in Unicode 9, and some terminals may not be aware. Set this if you see graphical glitching related to emoji (or other "special" characters). It should usually be auto-detected.
+   controls whether fish assumes emoji render as 2 cells or 1 cell wide. This is necessary because the correct value changed from 1 to 2 in Unicode 9, and some terminals may not be aware. Set this if you see graphical glitching related to emoji (or other "special" characters). It defaults to 2.
 
 .. envvar:: fish_autosuggestion_enabled
 
@@ -1636,8 +1625,10 @@ You can change the settings of fish by changing the values of certain variables.
 
 .. envvar:: fish_trace
 
-   if set and not empty, will cause fish to print commands before they execute, similar to ``set -x``
-   in bash. The trace is printed to the path given by the `--debug-output` option to fish or the :envvar:`FISH_DEBUG_OUTPUT` variable. It goes to stderr by default.
+   if set and not empty, will cause fish to print commands before they execute, similar to ``set -x`` in bash.
+   The trace is printed to the path given by the `--debug-output` option to fish or the :envvar:`FISH_DEBUG_OUTPUT` variable.
+   It goes to stderr by default.
+   Set it to ``all`` to also trace execution of key bindings, event handlers as well as prompt and title functions.
 
 .. envvar:: FISH_DEBUG
 
@@ -1655,6 +1646,18 @@ You can change the settings of fish by changing the values of certain variables.
 
    the current file creation mask. The preferred way to change the umask variable is through the :doc:`umask <cmds/umask>` function. An attempt to set umask to an invalid value will always fail.
 
+.. envvar:: SHELL_PROMPT_PREFIX
+
+   if set, this string is automatically prepended to the left prompt. This is a standard environment variable that may be set by tools like systemd's ``run0`` to indicate special shell sessions.
+
+.. envvar:: SHELL_PROMPT_SUFFIX
+
+   if set, this string is automatically appended to the left prompt. This is a standard environment variable that may be set by tools like systemd's ``run0`` to indicate special shell sessions.
+
+.. envvar:: SHELL_WELCOME
+
+   if set, this string is displayed when an interactive shell starts, after the greeting. This is a standard environment variable that may be set by tools like systemd's ``run0`` to display session information.
+
 .. envvar:: BROWSER
 
    your preferred web browser. If this variable is set, fish will use the specified browser instead of the system default browser to display the fish documentation.
@@ -1668,6 +1671,10 @@ Fish also provides additional information through the values of certain environm
 .. envvar:: argv
 
    a list of arguments to the shell or function. ``argv`` is only defined when inside a function call, or if fish was invoked with a list of arguments, like ``fish myscript.fish foo bar``. This variable can be changed.
+
+.. envvar:: argv_opts
+
+   :doc:`argparse <cmds/argparse>` sets this to the list of successfully parsed options, including option-arguments. This variable can be changed.
 
 .. envvar:: CMD_DURATION
 
@@ -1692,6 +1699,15 @@ Fish also provides additional information through the values of certain environm
 .. envvar:: fish_pid
 
    the process ID (PID) of the shell.
+
+.. envvar:: fish_terminal_color_theme
+
+   a read-only variable;
+   set to ``light`` or ``dark`` when the terminal uses a light or dark color theme respectively;
+   set to ``unknown`` if the terminal does not :ref:`report its colors <term-compat-query-background-color>`.
+   Like :ref:`status terminal <status-terminal>`, this is only populated once the first interactive prompt is shown.
+   This is used in an :ref:`--on-variable event handler <event>` to update :ref:`syntax highlighting <syntax-highlighting>` variables whenever the terminal's color theme changes.
+   See :ref:`here <fish-config-theme-files>` for how to specify ``light`` and ``dark`` variants in your theme.
 
 .. envvar:: history
 
@@ -1813,49 +1829,53 @@ Whether ``cat`` here will see a SIGPIPE depends on how long the file is and how 
 Locale Variables
 ^^^^^^^^^^^^^^^^
 
-The "locale" of a program is its set of language and regional settings that depend on language and cultural convention. In UNIX, these are made up of several categories. The categories are:
+The "locale" of a program is its set of language and regional settings.
+In UNIX, these are made up of several categories. The categories used by fish are:
 
 .. envvar:: LANG
 
-   This is the typical environment variable for specifying a locale. A user may set this variable to express the language they speak, their region, and a character encoding. The actual values are specific to their platform, except for special values like ``C`` or ``POSIX``.
+   This is the typical environment variable for specifying a locale.
+   A user may set this variable to express the language they speak, their region, and a character encoding.
+   The encoding part is ignored, fish always assumes UTF-8. The actual values are specific to their platform, except for special values like ``C`` or ``POSIX``.
 
-   The value of LANG is used for each category unless the variable for that category was set or LC_ALL is set. So typically you only need to set LANG.
+   The value of ``LANG`` is used for each category unless the variable for that category was set or ``LC_ALL`` is set. So typically you only need to set LANG.
 
-   An example value might be ``en_US.UTF-8`` for the american version of english and the UTF-8 encoding, or ``de_AT.UTF-8`` for the austrian version of german and the UTF-8 encoding.
+   Example values are ``en_US.UTF-8`` for the American English or ``de_AT.UTF-8`` for Austrian German.
    Your operating system might have a ``locale`` command that you can call as ``locale -a`` to see a list of defined locales.
 
-   A UTF-8 encoding is recommended.
+.. envvar:: LANGUAGE
+
+   This is treated like :envvar:`LC_MESSAGES` except that it can hold multiple values,
+   which allows to specify a priority list of languages for translation.
+   It's a :ref:`PATH variable <variables-path>`, like in `GNU gettext <https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html>`__.
+
+   Language identifiers without a region specified (e.g. ``zh``) result in all available variants of this language being tried in arbitrary order.
+   In this example, we might first look for messages in the ``zh_CN`` catalog, followed by ``zh_TW``, or the other way around.
+   This is different from GNU gettext, which uses a "default" variant of the language instead.
+   If you prefer a certain variant, specify it earlier in the list,
+   e.g. ``zh_TW:zh`` if your preferred language is ``zh_TW``, and you prefer any other variants of ``zh`` over the English default.
+   If ``zh_TW`` is the only variant of ``zh`` you want,
+   specifying ``zh_TW`` in the ``LANGUAGE`` variable will result in messages which are not available in ``zh_TW`` being displayed in English.
+
+   See also :doc:`builtin _ (underscore) <cmds/_>`.
 
 .. envvar:: LC_ALL
 
-   Overrides the :envvar:`LANG` environment variable and the values of the other ``LC_*`` variables. If this is set, none of the other variables are used for anything.
-
-   Usually the other variables should be used instead. Use LC_ALL only when you need to override something.
-
-.. envvar:: LC_COLLATE
-
-   This determines the rules about equivalence of cases and alphabetical ordering: collation.
-
-.. envvar:: LC_CTYPE
-
-   This determines classification rules, like if the type of character is an alpha, digit, and so on.
-   Most importantly, it defines the text *encoding* - which numbers map to which characters. On modern systems, this should typically be something ending in "UTF-8".
+   Overrides the :envvar:`LANG` and all other ``LC_*`` variables.
+   Please use ``LC_ALL`` only as a temporary override.
 
 .. envvar:: LC_MESSAGES
 
-   ``LC_MESSAGES`` determines the language in which messages are diisplayed.
-
-.. envvar:: LC_MONETARY
-
-   Determines currency, how it is formatted, and the symbols used.
+   Determines the language in which messages are displayed, see :doc:`builtin _ (underscore) <cmds/_>`.
 
 .. envvar:: LC_NUMERIC
 
-   Sets the locale for formatting numbers.
+   Sets the locale for :doc:`formatting numbers <cmds/printf>`.
 
 .. envvar:: LC_TIME
 
-   Sets the locale for formatting dates and times.
+   Determines how date and time are displayed.
+   Used in the :ref:`history <history-show-time>` builtin.
 
 .. _builtin-overview:
 
@@ -1876,9 +1896,7 @@ Fish includes a number of commands in the shell directly. We call these "builtin
 
 For a list of all builtins, use ``builtin -n``.
 
-For a list of all builtins, functions and commands shipped with fish, see the :ref:`list of commands <Commands>`. The documentation is also available by using the ``--help`` switch.
-
-.. _command-lookup:
+For a list of all builtins, functions and commands shipped with fish, see the :doc:`list of commands <commands>`. The documentation is also available by using the ``--help`` switch.
 
 Command lookup
 --------------
@@ -1958,8 +1976,6 @@ Let's make up an example. This function will :ref:`glob <expand-wildcard>` the f
 
 If you run this as ``show_files /``, it will most likely ask you until you press Y/y or N/n. If you run this as ``show_files / | cat``, it will print the files without asking. If you run this as ``show_files .``, it might print something without asking because there are fewer than five files.
 
-.. _identifiers:
-
 Shell variable and function names
 ---------------------------------
 
@@ -2026,17 +2042,25 @@ You can see the current list of features via ``status features``::
     ampersand-nobg-in-token on  3.4 & only backgrounds if followed by a separating character
     remove-percent-self     off 4.0 %self is no longer expanded (use $fish_pid)
     test-require-arg        off 4.0 builtin test requires an argument
+    mark-prompt             on  4.0 write OSC 133 prompt markers to the terminal
     ignore-terminfo         on  4.1 do not look up $TERM in terminfo database
+    query-term              on  4.1 query the TTY to enable extra functionality
+    omit-term-workarounds   off 4.3 skip workarounds for incompatible terminals
 
 Here is what they mean:
 
 - ``stderr-nocaret`` was introduced in fish 3.0 and cannot be turned off since fish 3.5. It can still be tested for compatibility, but a ``no-stderr-nocaret`` value will be ignored. The flag made ``^`` an ordinary character instead of denoting an stderr redirection. Use ``2>`` instead.
 - ``qmark-noglob`` was also introduced in fish 3.0 (and made the default in 4.0). It makes ``?`` an ordinary character instead of a single-character glob. Use a ``*`` instead (which will match multiple characters) or find other ways to match files like ``find``.
 - ``regex-easyesc`` was introduced in 3.1 (and made the default in 3.5). It makes it so the replacement expression in ``string replace -r`` does one fewer round of escaping. Before, to escape a backslash you would have to use ``string replace -ra '([ab])' '\\\\\\\\$1'``. After, just ``'\\\\$1'`` is enough. Check your ``string replace`` calls if you use this anywhere.
-- ``ampersand-nobg-in-token`` was introduced in fish 3.4 (and made the default in 3.5). It makes it so a ``&`` i no longer interpreted as the backgrounding operator in the middle of a token, so dealing with URLs becomes easier. Either put spaces or a semicolon after the ``&``. This is recommended formatting anyway, and ``fish_indent`` will have done it for you already.
+- ``ampersand-nobg-in-token`` was introduced in fish 3.4 (and made the default in 3.5). It makes it so a ``&`` is no longer interpreted as the backgrounding operator in the middle of a token, so dealing with URLs becomes easier. Either put spaces or a semicolon after the ``&``. This is recommended formatting anyway, and ``fish_indent`` will have done it for you already.
 - ``remove-percent-self`` turns off the special ``%self`` expansion. It was introduced in 4.0. To get fish's pid, you can use the :envvar:`fish_pid` variable.
 - ``test-require-arg`` removes :doc:`builtin test <cmds/test>`'s one-argument form (``test "string"``. It was introduced in 4.0. To test if a string is non-empty, use ``test -n "string"``. If disabled, any call to ``test`` that would change sends a :ref:`debug message <debugging-fish>` of category "deprecated-test", so starting fish with ``fish --debug=deprecated-test`` can be used to find offending calls.
-- ``ignore-terminfo`` disables lookup of $TERM in the terminfo database. Use ``no-ignore-terminfo`` to turn it back on.
+- ``mark-prompt`` makes fish report to the terminal the beginning and end of both shell prompts and command output.
+- ``ignore-terminfo`` was introduced in fish 4.1 and cannot be turned off since fish 4.5. It can still be tested for compatibility, but a ``no-ignore-terminfo`` value will be ignored. The flag disabled lookup of $TERM in the terminfo database.
+- ``query-term`` allows fish to query the terminal by writing escape sequences and reading the terminal's response.
+  This enables features such as :ref:`scrolling <term-compat-cursor-position-report>`.
+  If you use an incompatible terminal, you can -- for the time being -- work around it by running (once) ``set -Ua fish_features no-query-term``.
+- ``omit-term-workarounds`` prevents fish from trying to work around incompatible terminals.
 
 
 These changes are introduced off by default. They can be enabled on a per session basis::

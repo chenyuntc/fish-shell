@@ -1,13 +1,26 @@
 #RUN: %fish %s
 #REQUIRES: command -v tmux
 
-set -g isolated_tmux_fish_extra_args -C '
+isolated-tmux-start -C '
     set -g fish_autosuggestion_enabled 0
     function abbr-test
     end
     abbr -g abbr-test "abbr-test [expanded]"
 '
-isolated-tmux-start
+
+if { command -v less && ! less --version 2>&1 | grep BusyBox } >/dev/null
+    isolated-tmux send-keys "abbr --help | sed 1q | less" Enter
+    tmux-sleep
+    isolated-tmux capture-pane -p
+    isolated-tmux send-keys q
+else
+    echo '(END)'
+    echo 'prompt 0> abbr --help | sed 1q | less'
+    echo 'Documentation for abbr'
+end
+# CHECK: (END)
+# CHECK: prompt 0> abbr --help | sed 1q | less
+# CHECK: Documentation for abbr
 
 # Expand abbreviations on space.
 isolated-tmux send-keys abbr-test Space arg1 Enter

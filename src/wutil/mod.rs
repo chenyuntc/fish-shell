@@ -1,37 +1,32 @@
 pub mod dir_iter;
-pub mod encoding;
 pub mod errors;
 pub mod fileid;
-pub mod gettext;
 mod hex_float;
 #[macro_use]
 pub mod printf;
-#[cfg(test)]
-mod tests;
 pub mod wcstod;
 pub mod wcstoi;
 
-use crate::common::{
-    cstr2wcstring, fish_reserved_codepoint, str2wcstring, wcs2osstring, wcs2string, wcs2zstring,
+use crate::{fds::BorrowedFdFile, flog, signal::SigChecker};
+use errno::{Errno, set_errno};
+use fish_util::{perror, write_to_fd};
+use fish_wcstringutil::join_strings;
+use fish_widestring::{
+    IntoCharIter, L, WExt as _, WString, bytes2wcstring, fish_reserved_codepoint, osstr2wcstring,
+    str2bytes_callback, wcs2osstring, wcs2zstring, wstr,
 };
-use crate::fallback;
-use crate::flog::FLOGF;
-use crate::wchar::{wstr, WString, L};
-use crate::wchar_ext::WExt;
-use crate::wcstringutil::{join_strings, wcs2string_callback};
-use errno::errno;
-pub use gettext::{
-    localizable_consts, localizable_string, wgettext, wgettext_fmt, LocalizableString,
+use nix::unistd::AccessFlags;
+use std::{
+    ffi::OsStr,
+    fs::{self, canonicalize},
+    io,
+    os::unix::prelude::*,
 };
-use std::ffi::{CStr, OsStr};
-use std::fs::{self, canonicalize};
-use std::io::{self, Write};
-use std::os::unix::prelude::*;
 
 pub use crate::wutil::printf::{eprintf, fprintf, printf, sprintf};
 
 pub use fileid::{
-    file_id_for_file, file_id_for_path, file_id_for_path_narrow, DevInode, FileId, INVALID_FILE_ID,
+    DevInode, FileId, INVALID_FILE_ID, file_id_for_file, file_id_for_path, file_id_for_path_narrow,
 };
 pub use wcstoi::*;
 
@@ -56,46 +51,24 @@ pub fn lwstat(file_name: &wstr) -> io::Result<fs::Metadata> {
 
 /// Cover over fstat().
 pub fn fstat(fd: impl AsRawFd) -> io::Result<fs::Metadata> {
-    let fd = fd.as_raw_fd();
-    let file = unsafe { fs::File::from_raw_fd(fd) };
-    let res = file.metadata();
-    let fd2 = file.into_raw_fd();
-    assert_eq!(fd, fd2);
-    res
+    let file = unsafe { BorrowedFdFile::from_raw_fd(fd.as_raw_fd()) };
+    file.metadata()
 }
 
 /// Wide character version of access().
-pub fn waccess(file_name: &wstr, mode: libc::c_int) -> libc::c_int {
-    let tmp = wcs2zstring(file_name);
-    unsafe { libc::access(tmp.as_ptr(), mode) }
+pub fn waccess(file_name: &wstr, amode: AccessFlags) -> nix::Result<()> {
+    let tmp = wcs2osstring(file_name);
+    nix::unistd::access(tmp.as_os_str(), amode)
 }
 
 /// Wide character version of unlink().
-pub fn wunlink(file_name: &wstr) -> libc::c_int {
-    let tmp = wcs2zstring(file_name);
-    unsafe { libc::unlink(tmp.as_ptr()) }
+pub fn wunlink(file_name: &wstr) -> io::Result<()> {
+    let tmp = wcs2osstring(file_name);
+    fs::remove_file(tmp)
 }
 
-pub fn wperror(s: &wstr) {
-    let bytes = wcs2string(s);
-    // We can't guarantee the string is 100% Unicode (why?), so we don't use std::str::from_utf8()
-    let s = OsStr::from_bytes(&bytes).to_string_lossy();
-    perror(&s)
-}
-
-/// Port of the wide-string wperror from `src/wutil.cpp` but for rust `&str`.
-pub fn perror(s: &str) {
-    let e = errno().0;
-    let mut stderr = std::io::stderr().lock();
-    if !s.is_empty() {
-        let _ = write!(stderr, "{s}: ");
-    }
-    let slice = unsafe {
-        let msg = libc::strerror(e);
-        CStr::from_ptr(msg).to_bytes()
-    };
-    let _ = stderr.write_all(slice);
-    let _ = stderr.write_all(b"\n");
+pub fn perror_nix(s: &str, e: nix::errno::Errno) {
+    eprintf!("%s: %s\n", s, e.desc());
 }
 
 pub fn perror_io(s: &str, e: &io::Error) {
@@ -104,57 +77,32 @@ pub fn perror_io(s: &str, e: &io::Error) {
 
 /// Wide character version of getcwd().
 pub fn wgetcwd() -> WString {
-    let mut cwd = [b'\0'; libc::PATH_MAX as usize];
-    let res = unsafe {
-        libc::getcwd(
-            std::ptr::addr_of_mut!(cwd).cast(),
-            std::mem::size_of_val(&cwd),
-        )
-    };
-    if !res.is_null() {
-        return cstr2wcstring(&cwd);
+    match std::env::current_dir() {
+        Ok(cwd) => osstr2wcstring(cwd),
+        Err(e) => {
+            flog!(error, "std::env::current_dir() failed with error:", e);
+            WString::new()
+        }
     }
-
-    FLOGF!(
-        error,
-        "getcwd() failed with errno %d/%s",
-        errno::errno().0,
-        errno::errno().to_string()
-    );
-    WString::new()
 }
 
 /// Wide character version of readlink().
 pub fn wreadlink(file_name: &wstr) -> Option<WString> {
-    let md = lwstat(file_name).ok()?;
-    let bufsize = usize::try_from(md.len()).unwrap() + 1;
-    let mut target_buf = vec![b'\0'; bufsize];
-    let tmp = wcs2zstring(file_name);
-    let nbytes = unsafe {
-        libc::readlink(
-            tmp.as_ptr(),
-            std::ptr::addr_of_mut!(target_buf[0]).cast(),
-            bufsize,
-        )
-    };
-    if nbytes == -1 {
-        perror("readlink");
-        return None;
+    let _ = lwstat(file_name).ok()?;
+    match fs::read_link(wcs2osstring(file_name)) {
+        Ok(target) => Some(osstr2wcstring(target)),
+        Err(e) => {
+            perror_io("readlink", &e);
+            None
+        }
     }
-    // The link might have been modified after our call to lstat.  If the link now points to a path
-    // that's longer than the original one, we can't read everything in our buffer.  Simply give
-    // up. We don't need to report an error since our only caller will already fall back to ENOENT.
-    let nbytes = usize::try_from(nbytes).unwrap();
-    if nbytes == bufsize {
-        return None;
-    }
-    Some(str2wcstring(&target_buf[0..nbytes]))
 }
 
 /// Wide character realpath. The last path component does not need to be valid. If an error occurs,
 /// `wrealpath()` returns `None`
 pub fn wrealpath(pathname: &wstr) -> Option<WString> {
     if pathname.is_empty() {
+        set_errno(Errno(0));
         return None;
     }
 
@@ -206,7 +154,7 @@ pub fn wrealpath(pathname: &wstr) -> Option<WString> {
         }
     };
 
-    Some(str2wcstring(&real_path))
+    Some(bytes2wcstring(&real_path))
 }
 
 /// Given an input path, "normalize" it:
@@ -257,36 +205,6 @@ pub fn normalize_path(path: &wstr, allow_leading_double_slashes: bool) -> WStrin
     result
 }
 
-#[test]
-fn test_normalize_path() {
-    fn norm_path(path: &wstr) -> WString {
-        normalize_path(path, true)
-    }
-    assert_eq!(norm_path(L!("")), ".");
-    assert_eq!(norm_path(L!("..")), "..");
-    assert_eq!(norm_path(L!("./")), ".");
-    assert_eq!(norm_path(L!("./.")), ".");
-    assert_eq!(norm_path(L!("/")), "/");
-    assert_eq!(norm_path(L!("//")), "//");
-    assert_eq!(norm_path(L!("///")), "/");
-    assert_eq!(norm_path(L!("////")), "/");
-    assert_eq!(norm_path(L!("/.///")), "/");
-    assert_eq!(norm_path(L!(".//")), ".");
-    assert_eq!(norm_path(L!("/.//../")), "/");
-    assert_eq!(norm_path(L!("////abc")), "/abc");
-    assert_eq!(norm_path(L!("/abc")), "/abc");
-    assert_eq!(norm_path(L!("/abc/")), "/abc");
-    assert_eq!(norm_path(L!("/abc/..def/")), "/abc/..def");
-    assert_eq!(norm_path(L!("//abc/../def/")), "//def");
-    assert_eq!(norm_path(L!("abc/../abc/../abc/../abc")), "abc");
-    assert_eq!(norm_path(L!("../../")), "../..");
-    assert_eq!(norm_path(L!("foo/./bar")), "foo/bar");
-    assert_eq!(norm_path(L!("foo/../")), ".");
-    assert_eq!(norm_path(L!("foo/../foo")), "foo");
-    assert_eq!(norm_path(L!("foo/../foo/")), "foo");
-    assert_eq!(norm_path(L!("foo/././bar/.././baz")), "foo/baz");
-}
-
 /// Given an input path `path` and a working directory `wd`, do a "normalizing join" in a way
 /// appropriate for cd. That is, return effectively wd + path while resolving leading ../s from
 /// path. The intent here is to allow 'cd' out of a directory which may no longer exist, without
@@ -318,6 +236,7 @@ pub fn path_normalize_for_cd(wd: &wstr, path: &wstr) -> WString {
 
     // Erase leading . and .. components from path_comps, popping from wd_comps as we go.
     while let Some(comp) = path_comps.peek() {
+        #[allow(clippy::if_same_then_else)]
         if comp.is_empty() || comp == "." {
             path_comps.next();
         } else if comp == ".." && wd_comps.pop_back().is_some() {
@@ -340,98 +259,6 @@ pub fn path_normalize_for_cd(wd: &wstr, path: &wstr) -> WString {
         result.push(SEP);
     }
     result
-}
-
-#[cfg(test)]
-mod path_cd_tests {
-    use super::path_normalize_for_cd;
-    use crate::wchar::L;
-
-    #[test]
-    fn relative_path() {
-        let wd = L!("/home/user/");
-        let path = L!("projects");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/projects"));
-    }
-
-    #[test]
-    fn absolute_path() {
-        let wd = L!("/home/user/");
-        let path = L!("/etc");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/etc"));
-    }
-
-    #[test]
-    fn parent_directory() {
-        let wd = L!("/home/user/projects/");
-        let path = L!("../docs");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/docs"));
-    }
-
-    #[test]
-    fn current_directory() {
-        let wd = L!("/home/user/");
-        let path = L!("./");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user"));
-    }
-
-    #[test]
-    fn nested_parent_directory() {
-        let wd = L!("/home/user/projects/");
-        let path = L!("../../");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/home"));
-    }
-
-    #[test]
-    fn complex_path() {
-        let wd = L!("/home/user/projects/");
-        let path = L!("./../other/projects/./.././../docs");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(
-            path_normalize_for_cd(wd, path),
-            L!("/home/user/other/projects/./.././../docs")
-        );
-    }
-
-    #[test]
-    fn root_directory() {
-        let wd = L!("/");
-        let path = L!("..");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/.."));
-    }
-
-    #[test]
-    fn up_to_root_directory() {
-        let wd = L!("/foo/");
-        let path = L!("..");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/"));
-    }
-
-    #[test]
-    fn empty_path() {
-        let wd = L!("/home/user/");
-        let path = L!("");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/"));
-    }
-
-    #[test]
-    fn trailing_slash() {
-        let wd = L!("/home/user/projects/");
-        let path = L!("docs/");
-        eprintf!("(%ls, %ls)\n", wd, path);
-        assert_eq!(
-            path_normalize_for_cd(wd, path),
-            L!("/home/user/projects/docs/")
-        );
-    }
 }
 
 /// Wide character version of dirname().
@@ -502,35 +329,49 @@ pub fn wbasename(mut path: &wstr) -> &wstr {
     path
 }
 
-/// Wide character version of rename.
-pub fn wrename(old_name: &wstr, new_name: &wstr) -> libc::c_int {
-    let old_narrow = wcs2zstring(old_name);
-    let new_narrow = wcs2zstring(new_name);
-    unsafe { libc::rename(old_narrow.as_ptr(), new_narrow.as_ptr()) }
-}
-
-pub fn write_to_fd(input: &[u8], fd: RawFd) -> nix::Result<usize> {
-    nix::unistd::write(unsafe { BorrowedFd::borrow_raw(fd) }, input)
-}
-
 /// Write a wide string to a file descriptor. This avoids doing any additional allocation.
-/// This does NOT retry on EINTR or EAGAIN, it simply returns.
-/// Return -1 on error in which case errno will have been set. In this event, the number of bytes
-/// actually written cannot be obtained.
-pub fn wwrite_to_fd(input: &wstr, fd: RawFd) -> Option<usize> {
+/// Returns nothing when interrupted by ctrl-c or HUP.
+pub fn unescape_bytes_and_write_to_fd(input: impl IntoCharIter, fd: RawFd) -> Option<usize> {
     // Accumulate data in a local buffer.
-    let mut accum = [b'\0'; 512];
+    let mut accum = [0u8; 512];
     let mut accumlen = 0;
-    let maxaccum: usize = std::mem::size_of_val(&accum);
+    let accum_capacity = accum.len();
 
     // Helper to perform a write to 'fd', looping as necessary.
     // Return true on success, false on error.
     let mut total_written = 0;
 
-    fn do_write(fd: RawFd, total_written: &mut usize, mut buf: &[u8]) -> bool {
+    fn do_write(
+        sigcheck: &mut SigChecker,
+        fd: RawFd,
+        total_written: &mut usize,
+        mut buf: &[u8],
+    ) -> bool {
         while !buf.is_empty() {
-            let Ok(amt) = write_to_fd(buf, fd) else {
-                return false;
+            let amt = match write_to_fd(buf, fd) {
+                Ok(amt) => amt,
+                Err(err) => {
+                    // Some of our builtins emit multiple screens worth of data sent to a pager (the primary
+                    // example being the `history` builtin) and receiving SIGINT should be considered normal and
+                    // non-exceptional (user request to abort via Ctrl-C), meaning we shouldn't print an error.
+                    //
+                    // We have two options here: we can either return false without setting errored_ to
+                    // true (*this* write will be silently aborted but the onus is on the caller to check
+                    // the return value and skip future calls to `append()`) or we can flag the entire
+                    // output stream as errored, causing us to both return false and skip any future writes.
+                    // We're currently going with the latter, especially seeing as no callers currently
+                    // check the result of `append()` (since it was always a void function before).
+                    match err {
+                        nix::errno::Errno::EINTR => {
+                            if !sigcheck.check() {
+                                continue;
+                            }
+                        }
+                        nix::errno::Errno::EPIPE => (),
+                        _ => perror("write"),
+                    }
+                    return false;
+                }
             };
             *total_written += amt;
             assert!(amt <= buf.len(), "Wrote more than requested");
@@ -540,42 +381,40 @@ pub fn wwrite_to_fd(input: &wstr, fd: RawFd) -> Option<usize> {
     }
 
     // Helper to flush the accumulation buffer.
-    let flush_accum = |total_written: &mut usize, accum: &[u8], accumlen: &mut usize| {
-        if !do_write(fd, total_written, &accum[..*accumlen]) {
+    let flush_accum = |sigcheck: &mut SigChecker,
+                       total_written: &mut usize,
+                       accum: &[u8],
+                       accumlen: &mut usize| {
+        if !do_write(sigcheck, fd, total_written, &accum[..*accumlen]) {
             return false;
         }
         *accumlen = 0;
         true
     };
 
-    let mut success = wcs2string_callback(input, |buff: &[u8]| {
-        if buff.len() + accumlen > maxaccum {
+    let mut sigcheck = SigChecker::new_sighupintterm();
+    let mut success = str2bytes_callback(input, |buff: &[u8]| {
+        if buff.len() + accumlen > accum_capacity {
             // We have to flush.
-            if !flush_accum(&mut total_written, &accum, &mut accumlen) {
+            if !flush_accum(&mut sigcheck, &mut total_written, &accum, &mut accumlen) {
                 return false;
             }
         }
-        if buff.len() + accumlen <= maxaccum {
+        if buff.len() + accumlen <= accum_capacity {
             // Accumulate more.
-            unsafe {
-                std::ptr::copy(&buff[0], &mut accum[accumlen], buff.len());
-            }
+            accum[accumlen..(accumlen + buff.len())].copy_from_slice(buff);
             accumlen += buff.len();
             true
         } else {
             // Too much data to even fit, just write it immediately.
-            do_write(fd, &mut total_written, buff)
+            do_write(&mut sigcheck, fd, &mut total_written, buff)
         }
     });
     // Flush any remaining.
     if success {
-        success = flush_accum(&mut total_written, &accum, &mut accumlen);
+        success = flush_accum(&mut sigcheck, &mut total_written, &accum, &mut accumlen);
     }
-    if success {
-        Some(total_written)
-    } else {
-        None
-    }
+    if success { Some(total_written) } else { None }
 }
 
 const PUA1_START: char = '\u{E000}';
@@ -594,10 +433,6 @@ pub(crate) fn fish_is_pua(c: char) -> bool {
 /// some code points. See issue #3050.
 pub fn fish_iswalnum(c: char) -> bool {
     !fish_reserved_codepoint(c) && !fish_is_pua(c) && c.is_alphanumeric()
-}
-
-pub fn fish_wcswidth(s: &wstr) -> isize {
-    fallback::fish_wcswidth(s)
 }
 
 /// Given that `cursor` is a pointer into `base`, return the offset in characters.
@@ -619,12 +454,230 @@ pub fn wstr_offset_in(cursor: &wstr, base: &wstr) -> usize {
     offset as usize
 }
 
-#[test]
-fn test_wstr_offset_in() {
-    use crate::wchar::L;
-    let base = L!("hello world");
-    assert_eq!(wstr_offset_in(&base[6..], base), 6);
-    assert_eq!(wstr_offset_in(&base[0..], base), 0);
-    assert_eq!(wstr_offset_in(&base[6..], &base[6..]), 0);
-    assert_eq!(wstr_offset_in(&base[base.len()..], base), base.len());
+#[cfg(test)]
+mod tests {
+    use super::{
+        normalize_path, unescape_bytes_and_write_to_fd, wbasename, wdirname, wstr_offset_in,
+    };
+    use crate::{prelude::*, tests::prelude::*};
+    use fish_widestring::bytes2wcstring;
+    use rand::Rng as _;
+    use std::{
+        fs::OpenOptions,
+        io::{Read as _, Seek as _},
+        os::{fd::AsRawFd as _, unix::fs::OpenOptionsExt as _},
+    };
+
+    mod test_path_normalize_for_cd {
+        use super::super::path_normalize_for_cd;
+        use fish_widestring::L;
+
+        #[test]
+        fn relative_path() {
+            let wd = L!("/home/user/");
+            let path = L!("projects");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/projects"));
+        }
+
+        #[test]
+        fn absolute_path() {
+            let wd = L!("/home/user/");
+            let path = L!("/etc");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/etc"));
+        }
+
+        #[test]
+        fn parent_directory() {
+            let wd = L!("/home/user/projects/");
+            let path = L!("../docs");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/docs"));
+        }
+
+        #[test]
+        fn current_directory() {
+            let wd = L!("/home/user/");
+            let path = L!("./");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user"));
+        }
+
+        #[test]
+        fn nested_parent_directory() {
+            let wd = L!("/home/user/projects/");
+            let path = L!("../../");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/home"));
+        }
+
+        #[test]
+        fn complex_path() {
+            let wd = L!("/home/user/projects/");
+            let path = L!("./../other/projects/./.././../docs");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(
+                path_normalize_for_cd(wd, path),
+                L!("/home/user/other/projects/./.././../docs")
+            );
+        }
+
+        #[test]
+        fn root_directory() {
+            let wd = L!("/");
+            let path = L!("..");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/.."));
+        }
+
+        #[test]
+        fn up_to_root_directory() {
+            let wd = L!("/foo/");
+            let path = L!("..");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/"));
+        }
+
+        #[test]
+        fn empty_path() {
+            let wd = L!("/home/user/");
+            let path = L!("");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(path_normalize_for_cd(wd, path), L!("/home/user/"));
+        }
+
+        #[test]
+        fn trailing_slash() {
+            let wd = L!("/home/user/projects/");
+            let path = L!("docs/");
+            eprintf!("(%s, %s)\n", wd, path);
+            assert_eq!(
+                path_normalize_for_cd(wd, path),
+                L!("/home/user/projects/docs/")
+            );
+        }
+    }
+
+    #[test]
+    fn test_normalize_path() {
+        fn norm_path(path: &wstr) -> WString {
+            normalize_path(path, true)
+        }
+        assert_eq!(norm_path(L!("")), ".");
+        assert_eq!(norm_path(L!("..")), "..");
+        assert_eq!(norm_path(L!("./")), ".");
+        assert_eq!(norm_path(L!("./.")), ".");
+        assert_eq!(norm_path(L!("/")), "/");
+        assert_eq!(norm_path(L!("//")), "//");
+        assert_eq!(norm_path(L!("///")), "/");
+        assert_eq!(norm_path(L!("////")), "/");
+        assert_eq!(norm_path(L!("/.///")), "/");
+        assert_eq!(norm_path(L!(".//")), ".");
+        assert_eq!(norm_path(L!("/.//../")), "/");
+        assert_eq!(norm_path(L!("////abc")), "/abc");
+        assert_eq!(norm_path(L!("/abc")), "/abc");
+        assert_eq!(norm_path(L!("/abc/")), "/abc");
+        assert_eq!(norm_path(L!("/abc/..def/")), "/abc/..def");
+        assert_eq!(norm_path(L!("//abc/../def/")), "//def");
+        assert_eq!(norm_path(L!("abc/../abc/../abc/../abc")), "abc");
+        assert_eq!(norm_path(L!("../../")), "../..");
+        assert_eq!(norm_path(L!("foo/./bar")), "foo/bar");
+        assert_eq!(norm_path(L!("foo/../")), ".");
+        assert_eq!(norm_path(L!("foo/../foo")), "foo");
+        assert_eq!(norm_path(L!("foo/../foo/")), "foo");
+        assert_eq!(norm_path(L!("foo/././bar/.././baz")), "foo/baz");
+    }
+
+    #[test]
+    fn test_wdirname_wbasename() {
+        // path, dir, base
+        struct Test(&'static wstr, &'static wstr, &'static wstr);
+        let testcases: &[Test] = &[
+            Test(L!(""), L!("."), L!(".")),
+            Test(L!("foo//"), L!("."), L!("foo")),
+            Test(L!("foo//////"), L!("."), L!("foo")),
+            Test(L!("/////foo"), L!("/"), L!("foo")),
+            Test(L!("//foo/////bar"), L!("//foo"), L!("bar")),
+            Test(L!("foo/////bar"), L!("foo"), L!("bar")),
+            // Examples given in XPG4.2.
+            Test(L!("/usr/lib"), L!("/usr"), L!("lib")),
+            Test(L!("usr"), L!("."), L!("usr")),
+            Test(L!("/"), L!("/"), L!("/")),
+            Test(L!("."), L!("."), L!(".")),
+            Test(L!(".."), L!("."), L!("..")),
+        ];
+
+        for tc in testcases {
+            let Test(path, tc_dir, tc_base) = *tc;
+            let dir = wdirname(path);
+            assert_eq!(
+                dir, tc_dir,
+                "\npath: {:?}, dir: {:?}, tc.dir: {:?}",
+                path, dir, tc_dir
+            );
+
+            let base = wbasename(path);
+            assert_eq!(
+                base, tc_base,
+                "\npath: {:?}, base: {:?}, tc.base: {:?}",
+                path, base, tc_base
+            );
+        }
+
+        // Ensure strings which greatly exceed PATH_MAX still work (#7837).
+        const PATH_MAX: usize = libc::PATH_MAX as usize;
+        let mut longpath = WString::new();
+        longpath.reserve(PATH_MAX * 2 + 10);
+        while longpath.char_count() <= PATH_MAX * 2 {
+            longpath.push_str("/overlong");
+        }
+        let last_slash = longpath.chars().rposition(|c| c == '/').unwrap();
+        let longpath_dir = &longpath[..last_slash];
+        assert_eq!(wdirname(&longpath), longpath_dir);
+        assert_eq!(wbasename(&longpath), L!("overlong"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_wwrite_to_fd() {
+        test_init();
+        let temp_file = fish_tempfile::new_file().unwrap();
+        let mut rng = rand::rng();
+        let sizes = [1, 2, 3, 5, 13, 23, 64, 128, 255, 4096, 4096 * 2];
+        for &size in &sizes {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o666)
+                .open(temp_file.path())
+                .unwrap();
+            let mut input = Vec::new();
+            for _i in 0..size {
+                input.push(rng.random());
+            }
+
+            let amt =
+                unescape_bytes_and_write_to_fd(&bytes2wcstring(&input), file.as_raw_fd()).unwrap();
+            assert_eq!(amt, input.len());
+
+            file.seek(std::io::SeekFrom::Start(0)).unwrap();
+
+            let mut contents = vec![];
+            file.read_to_end(&mut contents).unwrap();
+            assert_eq!(&contents, &input);
+        }
+    }
+
+    #[test]
+    fn test_wstr_offset_in() {
+        use fish_widestring::L;
+        let base = L!("hello world");
+        assert_eq!(wstr_offset_in(&base[6..], base), 6);
+        assert_eq!(wstr_offset_in(&base[0..], base), 0);
+        assert_eq!(wstr_offset_in(&base[6..], &base[6..]), 0);
+        assert_eq!(wstr_offset_in(&base[base.len()..], base), base.len());
+    }
 }

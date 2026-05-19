@@ -4,7 +4,7 @@
 
 pub mod flog_safe;
 pub mod postfork;
-#[cfg(FISH_USE_POSIX_SPAWN)]
+#[cfg(have_posix_spawn)]
 pub mod spawn;
 use crate::proc::Job;
 use libc::{SIGINT, SIGQUIT};
@@ -22,3 +22,11 @@ pub fn blocked_signals_for_job(job: &Job, sigmask: &mut libc::sigset_t) -> bool 
     }
     false
 }
+
+// Bravely define _PATH_BSHELL. On practice it's /bin/sh everywhere, except on Android.
+// NOTE: this is currently duplicated in __fish_posix_shell.
+#[cfg(not(target_os = "android"))]
+pub static PATH_BSHELL: &[u8] = b"/bin/sh\0";
+
+#[cfg(target_os = "android")]
+pub static PATH_BSHELL: &[u8] = b"/system/bin/sh\0";

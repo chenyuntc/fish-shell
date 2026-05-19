@@ -19,6 +19,8 @@ Unlike other shells, fish's prompt is built by running a function - :doc:`fish_p
 
 These functions are run, and whatever they print is displayed as the prompt (minus one trailing newline).
 
+If the :envvar:`SHELL_PROMPT_PREFIX` or :envvar:`SHELL_PROMPT_SUFFIX` environment variables are set, they are automatically prepended and appended to the left prompt.
+
 Here, we will just be writing a simple fish_prompt.
 
 Our first prompt
@@ -67,10 +69,10 @@ Fortunately, fish offers the :doc:`set_color <cmds/set_color>` command, so you c
 So, taking our previous prompt and adding some color::
 
   function fish_prompt
-      string join '' -- (set_color green) $PWD (set_color normal) '>'
+      string join '' -- (set_color green) $PWD (set_color --reset) '>'
   end
 
-A "normal" color tells the terminal to go back to its normal formatting options.
+"--reset" tells the terminal to go back to its default formatting options.
 
 ``set_color`` works by producing an escape sequence, which is a special piece of text that terminals
 interpret as instructions - for example, to change color. So ``set_color red`` produces the same
@@ -86,13 +88,13 @@ Shortening the working directory
 This is fine, but our :envvar:`PWD` can be a bit long, and we are typically only interested in the last few directories. We can shorten this with the :doc:`prompt_pwd <cmds/prompt_pwd>` helper that will give us a shortened working directory::
 
   function fish_prompt
-      string join '' -- (set_color green) (prompt_pwd) (set_color normal) '>'
+      string join '' -- (set_color green) (prompt_pwd) (set_color --reset) '>'
   end
 
 ``prompt_pwd`` takes options to control how much to shorten. For instance, if we want to display the last two directories, we'd use ``prompt_pwd --full-length-dirs 2``::
 
   function fish_prompt
-      string join '' -- (set_color green) (prompt_pwd --full-length-dirs 2) (set_color normal) '>'
+      string join '' -- (set_color green) (prompt_pwd --full-length-dirs 2) (set_color --reset) '>'
   end
 
 With a current directory of "/home/tutorial/Music/Lena Raine/Oneknowing", this would print
@@ -113,19 +115,19 @@ It's useful to display this in your prompt, but showing it when it's 0 seems kin
 First of all, since every command (except for :doc:`set <cmds/set>`) changes the status, you need to store it for later use as the first thing in your prompt. Use a :ref:`local variable <variables-scope>` so it will be confined to your prompt function::
 
   set -l last_status $status
-  
+
 And after that, you can set a string if it is not zero::
-  
+
   # Prompt status only if it's not 0
   set -l stat
   if test $last_status -ne 0
-      set stat (set_color red)"[$last_status]"(set_color normal)
+      set stat (set_color red)"[$last_status]"(set_color --reset)
   end
 
 And to print it, we add it to our ``string join``::
 
-  string join '' -- (set_color green) (prompt_pwd) (set_color normal) $stat '>'
-  
+  string join '' -- (set_color green) (prompt_pwd) (set_color --reset) $stat '>'
+
 If ``$last_status`` was 0, ``$stat`` is empty, and so it will simply disappear.
 
 So our entire prompt is now::
@@ -135,10 +137,10 @@ So our entire prompt is now::
       # Prompt status only if it's not 0
       set -l stat
       if test $last_status -ne 0
-          set stat (set_color red)"[$last_status]"(set_color normal)
+          set stat (set_color red)"[$last_status]"(set_color --reset)
       end
 
-      string join '' -- (set_color green) (prompt_pwd) (set_color normal) $stat '>'
+      string join '' -- (set_color green) (prompt_pwd) (set_color --reset) $stat '>'
   end
 
 And it looks like:
@@ -176,11 +178,11 @@ So you can use it to declutter your old prompts. For example if you want to see 
           set pwd (prompt_pwd)
           # Prompt status only if it's not 0
           if test $last_status -ne 0
-              set stat (set_color red)"[$last_status]"(set_color normal)
+              set stat (set_color red)"[$last_status]"(set_color --reset)
           end
       end
 
-      string join '' -- (set_color green) $pwd (set_color normal) $stat '>'
+      string join '' -- (set_color green) $pwd (set_color --reset) $stat '>'
   end
 
 Now running two commands in the same directory could result in this screen:

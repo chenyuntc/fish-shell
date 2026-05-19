@@ -1,5 +1,3 @@
-.. _cmd-fish_breakpoint_prompt:
-
 fish_breakpoint_prompt - define the prompt when stopped at a breakpoint
 =======================================================================
 
@@ -36,6 +34,6 @@ A simple prompt that is a simplified version of the default debugging prompt::
         set -l function (status current-function)
         set -l line (status current-line-number)
         set -l prompt "$function:$line >"
-        echo -ns (set_color $fish_color_status) "BP $prompt" (set_color normal) ' '
+        echo -ns (set_color $fish_color_status) "BP $prompt" (set_color --reset) ' '
     end
 

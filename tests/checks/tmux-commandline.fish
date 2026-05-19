@@ -5,13 +5,12 @@
 # Haunted under CI
 #REQUIRES: test -z "$CI"
 
-set -g isolated_tmux_fish_extra_args -C '
+isolated-tmux-start -C '
     bind ctrl-q "functions --erase fish_right_prompt" "commandline \'\'" clear-screen
     set -g fish_autosuggestion_enabled 0
     bind ctrl-g "__fish_echo commandline --current-job"
     bind ctrl-t \'__fish_echo echo cursor is at offset $(commandline --cursor --current-token) in token\'
 '
-isolated-tmux-start
 
 isolated-tmux send-keys 'echo LINES $LINES' Enter
 tmux-sleep
@@ -42,29 +41,48 @@ isolated-tmux capture-pane -p
 
 isolated-tmux send-keys C-c
 tmux-sleep
-isolated-tmux send-keys C-l 'commandline -i ": \'$(seq $LINES)" A B "C\'"' Enter Enter
+isolated-tmux send-keys C-l
 tmux-sleep
-isolated-tmux capture-pane -p
+isolated-tmux send-keys '
+    function fish_right_prompt
+        echo right-prompt
+    end
+' 'commandline -i ": \'$(seq (math $LINES \* 2))\'"' Enter Enter
+tmux-sleep
+tmux-sleep
+# Detect whether this terminal adds a blank line after prompts with right-prompt.
+# Check if the first line captured with -S -12 is blank.
+set -l probe (isolated-tmux capture-pane -p -S -12 | head -1)
+# If it's blank or just whitespace, we need -13 to go back one more to get the prompt line
+string match -qr '^\s*$' -- $probe && set -l offset -13 || set -l offset -12
+isolated-tmux capture-pane -p -S $offset
+# CHECK: prompt 4> commandline -i ": '$(seq (math $LINES \* 2))'"            right-prompt
+# CHECK: prompt 5> : '1                                                      right-prompt
+# CHECK: 2
+# CHECK: 3
+# CHECK: 4
 # CHECK: 5
 # CHECK: 6
 # CHECK: 7
 # CHECK: 8
 # CHECK: 9
 # CHECK: 10
-# CHECK: A
-# CHECK: B
-# CHECK: C'
-# CHECK: prompt 5>
+# CHECK: 11
+# CHECK: 12
+# CHECK: 13
+# CHECK: 14
+# CHECK: 15
+# CHECK: 16
+# CHECK: 17
+# CHECK: 18
+# CHECK: 19
+# CHECK: 20'
+# CHECK: prompt 6>                                                           right-prompt
 
 # Soft-wrapped commandline with omitted right prompt.
-isolated-tmux send-keys C-q '
-    function fish_right_prompt
-        echo right-prompt
-    end
-    commandline -i "echo $(printf %0"$COLUMNS"d)"
-' Enter
+isolated-tmux send-keys 'commandline -i "echo $(printf %0"$COLUMNS"d)"' Enter C-l Enter
 tmux-sleep
-isolated-tmux capture-pane -p | sed 1,5d
+isolated-tmux capture-pane -p
 # CHECK: prompt {{\d+}}> echo 00000000000000000000000000000000000000000000000000000000000000000
 # CHECK: 000000000000000
 # CHECK: 00000000000000000000000000000000000000000000000000000000000000000000000000000000

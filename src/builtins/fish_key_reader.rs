@@ -7,39 +7,35 @@
 //!
 //! Type "exit" or "quit" to terminate the program.
 
-use std::{cell::RefCell, ops::ControlFlow, os::unix::prelude::OsStrExt};
+use std::ops::ControlFlow;
 
-use libc::{STDIN_FILENO, TCSANOW, VEOF, VINTR};
-use once_cell::unsync::OnceCell;
+use libc::{STDIN_FILENO, VEOF, VINTR};
 
-#[allow(unused_imports)]
-use crate::future::IsSomeAnd;
 use crate::{
-    builtins::shared::BUILTIN_ERR_UNKNOWN,
-    common::{shell_modes, str2wcstring, PROGRAM_NAME},
-    env::{env_init, EnvStack, Environment},
-    future_feature_flags,
+    builtins::error::Error,
+    common::{PROGRAM_NAME, get_program_name, shell_modes},
+    env::{EnvStack, Environment as _, env_init},
+    err_fmt, err_str,
     input_common::{
-        match_key_event_to_key, CharEvent, InputEventQueue, InputEventQueuer, KeyEvent,
-        QueryResponseEvent, TerminalQuery,
+        CharEvent, ImplicitEvent, InputEventQueue, InputEventQueuer as _, KeyEvent,
+        QueryResultEvent, match_key_event_to_key,
     },
-    key::{char_to_symbol, Key},
+    key::{Key, char_to_symbol},
     nix::isatty,
     panic::panic_handler,
+    prelude::*,
     print_help::print_help,
     proc::set_interactive_session,
-    reader::{check_exit_loop_maybe_warning, initial_query, reader_init},
-    signal::signal_set_handlers,
-    terminal::Capability,
+    reader::{
+        check_exit_loop_maybe_warning, reader_init, set_shell_modes,
+        signal_safe_reader_set_exit_signal, terminal_init,
+    },
     threads,
     topic_monitor::topic_monitor_init,
-    tty_handoff::{
-        get_kitty_keyboard_capability, initialize_tty_metadata, set_kitty_keyboard_capability,
-        TtyHandoff,
-    },
-    wchar::prelude::*,
-    wgetopt::{wopt, ArgType, WGetopter, WOption},
+    tty_handoff::TtyHandoff,
 };
+use fish_wgetopt::{ArgType, WGetopter, WOption, wopt};
+use fish_widestring::osstr2wcstring;
 
 use super::prelude::*;
 
@@ -53,7 +49,7 @@ fn should_exit(
 
     for evt in [VINTR, VEOF] {
         let modes = shell_modes();
-        let cc = Key::from_single_byte(modes.c_cc[evt]);
+        let cc = Key::from_single_byte(modes.control_chars[evt]);
 
         if match_key_event_to_key(&key_evt, &cc).is_some() {
             if recent_keys
@@ -65,9 +61,9 @@ fn should_exit(
             {
                 return true;
             }
-            streams.err.append(wgettext_fmt!(
-                "Press ctrl-%c again to exit\n",
-                char::from(modes.c_cc[evt] + 0x60)
+            streams.err.appendln(&wgettext_fmt!(
+                "Press ctrl-%c again to exit",
+                char::from(modes.control_chars[evt] + 0x60)
             ));
             return false;
         }
@@ -85,9 +81,13 @@ fn should_exit(
 }
 
 /// Process the characters we receive as the user presses keys.
-fn process_input(streams: &mut IoStreams, continuous_mode: bool, verbose: bool) -> BuiltinResult {
+fn process_input(
+    streams: &mut IoStreams,
+    continuous_mode: bool,
+    verbose: bool,
+    mut input_queue: InputEventQueue,
+) -> BuiltinResult {
     let mut first_char_seen = false;
-    let mut queue = InputEventQueue::new(STDIN_FILENO);
     let mut recent_chars = vec![];
     streams.err.appendln("Press a key:\n");
 
@@ -95,21 +95,21 @@ fn process_input(streams: &mut IoStreams, continuous_mode: bool, verbose: bool) 
     handoff.enable_tty_protocols();
 
     while (!first_char_seen || continuous_mode) && !check_exit_loop_maybe_warning(None) {
-        let kevt = match queue.readch() {
-            CharEvent::Key(kevt) => kevt,
-            CharEvent::Readline(_) | CharEvent::Command(_) | CharEvent::Implicit(_) => continue,
-            CharEvent::QueryResponse(QueryResponseEvent::PrimaryDeviceAttribute) => {
-                if get_kitty_keyboard_capability() == Capability::Unknown {
-                    set_kitty_keyboard_capability(|| {}, Capability::NotSupported);
-                }
+        use QueryResultEvent::*;
+        let kevt = match input_queue.readch() {
+            CharEvent::Implicit(ImplicitEvent::Eof) => {
+                signal_safe_reader_set_exit_signal(libc::SIGHUP);
                 continue;
             }
-            CharEvent::QueryResponse(_) => continue,
+            CharEvent::Key(kevt) => kevt,
+            CharEvent::Readline(_) | CharEvent::Command(_) | CharEvent::Implicit(_) => continue,
+            CharEvent::QueryResult(Timeout | Interrupted) => panic!("should not be querying"),
+            CharEvent::QueryResult(Response(_)) => continue,
         };
         if verbose {
             streams.out.append(L!("# decoded from: "));
             for (i, byte) in kevt.seq.chars().enumerate() {
-                streams.out.append(char_to_symbol(byte, i == 0));
+                streams.out.append(&char_to_symbol(byte, i == 0));
             }
             streams.out.append(L!("\n"));
         }
@@ -127,7 +127,7 @@ fn process_input(streams: &mut IoStreams, continuous_mode: bool, verbose: bool) 
             keys.push((base_layout_key, "physical key"));
         }
         for (key, explanation) in keys {
-            streams.out.append(sprintf!(
+            streams.out.append(&sprintf!(
                 "bind %s 'do something'%s%s\n",
                 key,
                 if explanation.is_empty() { "" } else { " # " },
@@ -150,14 +150,11 @@ fn setup_and_process_keys(
     streams: &mut IoStreams,
     continuous_mode: bool,
     verbose: bool,
+    input_queue: InputEventQueue,
 ) -> BuiltinResult {
-    signal_set_handlers(true);
     // We need to set the shell-modes for ICRNL,
     // in fish-proper this is done once a command is run.
-    unsafe { libc::tcsetattr(0, TCSANOW, &*shell_modes()) };
-    initialize_tty_metadata();
-    let blocking_query: OnceCell<RefCell<Option<TerminalQuery>>> = OnceCell::new();
-    initial_query(&blocking_query, streams.out, None);
+    set_shell_modes(STDIN_FILENO, "fish_key_reader");
 
     if continuous_mode {
         streams.err.append(L!("\n"));
@@ -165,18 +162,19 @@ fn setup_and_process_keys(
             .err
             .appendln("To terminate this program type \"exit\" or \"quit\" in this window,");
         let modes = shell_modes();
-        streams.err.appendln(wgettext_fmt!(
+        streams.err.appendln(&wgettext_fmt!(
             "or press ctrl-%c or ctrl-%c twice in a row.",
-            char::from(modes.c_cc[VINTR] + 0x60),
-            char::from(modes.c_cc[VEOF] + 0x60)
+            char::from(modes.control_chars[VINTR] + 0x60),
+            char::from(modes.control_chars[VEOF] + 0x60)
         ));
         streams.err.appendln(L!("\n"));
     }
 
-    process_input(streams, continuous_mode, verbose)
+    process_input(streams, continuous_mode, verbose, input_queue)
 }
 
 fn parse_flags(
+    parser: Option<&mut Parser>,
     streams: &mut IoStreams,
     args: Vec<WString>,
     continuous_mode: &mut bool,
@@ -189,7 +187,6 @@ fn parse_flags(
         wopt(L!("version"), ArgType::NoArgument, 'v'),
         wopt(L!("verbose"), ArgType::NoArgument, 'V'),
     ];
-
     let mut shim_args: Vec<&wstr> = args.iter().map(|s| s.as_ref()).collect();
     let mut w = WGetopter::new(short_opts, long_opts, &mut shim_args);
     while let Some(opt) = w.next_opt() {
@@ -198,13 +195,17 @@ fn parse_flags(
                 *continuous_mode = true;
             }
             'h' => {
-                print_help("fish_key_reader");
+                if let Some(parser) = parser {
+                    builtin_print_help(parser, streams, L!("fish_key_reader"));
+                } else {
+                    print_help("fish_key_reader");
+                }
                 return ControlFlow::Break(Ok(SUCCESS));
             }
             'v' => {
-                streams.out.appendln(wgettext_fmt!(
-                    "%ls, version %s",
-                    PROGRAM_NAME.get().unwrap(),
+                streams.out.appendln(&wgettext_fmt!(
+                    VERSION_STRING_TEMPLATE,
+                    get_program_name(),
                     crate::BUILD_VERSION
                 ));
                 return ControlFlow::Break(Ok(SUCCESS));
@@ -212,12 +213,16 @@ fn parse_flags(
             'V' => {
                 *verbose = true;
             }
+            ';' => {
+                err_fmt!(Error::UNEXP_OPT_ARG, w.argv[w.wopt_index - 1])
+                    .cmd(L!("fish_key_reader"))
+                    .finish(streams);
+                return ControlFlow::Break(Err(STATUS_CMD_ERROR));
+            }
             '?' => {
-                streams.err.append(wgettext_fmt!(
-                    BUILTIN_ERR_UNKNOWN,
-                    "fish_key_reader",
-                    w.argv[w.wopt_index - 1]
-                ));
+                err_fmt!(Error::UNKNOWN_OPT, w.argv[w.wopt_index - 1])
+                    .cmd(L!("fish_key_reader"))
+                    .finish(streams);
                 return ControlFlow::Break(Err(STATUS_CMD_ERROR));
             }
             _ => panic!(),
@@ -226,9 +231,7 @@ fn parse_flags(
 
     let argc = args.len() - w.wopt_index;
     if argc != 0 {
-        streams
-            .err
-            .appendln(wgettext_fmt!("Expected no arguments, got %d", argc));
+        err_fmt!("Expected no arguments, got %d", argc).finish(streams);
         return ControlFlow::Break(Err(STATUS_CMD_ERROR));
     }
 
@@ -236,7 +239,7 @@ fn parse_flags(
 }
 
 pub fn fish_key_reader(
-    _parser: &Parser,
+    parser: &mut Parser,
     streams: &mut IoStreams,
     args: &mut [&wstr],
 ) -> BuiltinResult {
@@ -244,16 +247,28 @@ pub fn fish_key_reader(
     let mut verbose = false;
 
     let args = args.iter_mut().map(|x| x.to_owned()).collect();
-    if let ControlFlow::Break(s) = parse_flags(streams, args, &mut continuous_mode, &mut verbose) {
+    if let ControlFlow::Break(s) = parse_flags(
+        Some(parser),
+        streams,
+        args,
+        &mut continuous_mode,
+        &mut verbose,
+    ) {
         return s;
     }
 
-    if streams.stdin_fd < 0 || unsafe { libc::isatty(streams.stdin_fd) } == 0 {
-        streams.err.appendln("Stdin must be attached to a tty.");
+    if streams.stdin_fd() < 0 || !isatty(streams.stdin_fd()) {
+        err_str!("Stdin must be attached to a tty.").finish(streams);
         return Err(STATUS_CMD_ERROR);
     }
 
-    setup_and_process_keys(streams, continuous_mode, verbose)
+    setup_and_process_keys(
+        streams,
+        continuous_mode,
+        verbose,
+        // Won't be querying, so no timeout value needed.
+        InputEventQueue::new(streams.stdin_fd(), None),
+    )
 }
 
 pub fn main() {
@@ -270,37 +285,42 @@ fn throwing_main() -> i32 {
     set_interactive_session(true);
     topic_monitor_init();
     threads::init();
+    #[cfg(feature = "localize-messages")]
+    crate::localization::initialize_localization();
     env_init(None, true, false);
     reader_init(false);
     if let Some(features_var) = EnvStack::globals().get(L!("fish_features")) {
         for s in features_var.as_list() {
-            future_feature_flags::set_from_string(s.as_utfstr());
+            fish_feature_flags::set_from_string(s.as_utfstr());
         }
     }
 
     let mut out = Fd(FdOutputStream::new(STDOUT_FILENO));
     let mut err = Fd(FdOutputStream::new(STDERR_FILENO));
     let io_chain = IoChain::new();
-    let mut streams = IoStreams::new(&mut out, &mut err, &io_chain);
+    let streams = &mut IoStreams::new(&mut out, &mut err, &io_chain);
 
     let mut continuous_mode = false;
     let mut verbose = false;
 
-    let args: Vec<WString> = std::env::args_os()
-        .map(|osstr| str2wcstring(osstr.as_bytes()))
-        .collect();
+    let args: Vec<WString> = std::env::args_os().map(osstr2wcstring).collect();
     if let ControlFlow::Break(s) =
-        parse_flags(&mut streams, args, &mut continuous_mode, &mut verbose)
+        parse_flags(None, streams, args, &mut continuous_mode, &mut verbose)
     {
         return s.builtin_status_code();
     }
 
-    if !isatty(libc::STDIN_FILENO) {
-        streams
-            .err
-            .appendln(wgettext!("Stdin must be attached to a tty."));
+    if !isatty(STDIN_FILENO) {
+        err_str!("Stdin must be attached to a tty.").finish(streams);
         return 1;
     }
 
-    setup_and_process_keys(&mut streams, continuous_mode, verbose).builtin_status_code()
+    let input_queue = {
+        let vars = EnvStack::new();
+        env_stack_set_from_env!(vars, "STY");
+        env_stack_set_from_env!(vars, "TERM");
+        terminal_init(&vars, STDIN_FILENO).input_queue
+    };
+
+    setup_and_process_keys(streams, continuous_mode, verbose, input_queue).builtin_status_code()
 }

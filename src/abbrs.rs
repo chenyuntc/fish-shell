@@ -1,18 +1,14 @@
-#![allow(clippy::extra_unused_lifetimes, clippy::needless_lifetimes)]
 use std::{
     collections::HashSet,
-    sync::{Mutex, MutexGuard},
+    sync::{LazyLock, Mutex, MutexGuard},
 };
 
-use crate::wchar::prelude::*;
-use once_cell::sync::Lazy;
+use crate::prelude::*;
 
 use crate::parse_constants::SourceRange;
-#[cfg(test)]
-use crate::tests::prelude::*;
 use pcre2::utf32::Regex;
 
-static ABBRS: Lazy<Mutex<AbbreviationSet>> = Lazy::new(|| Mutex::new(Default::default()));
+static ABBRS: LazyLock<Mutex<AbbreviationSet>> = LazyLock::new(|| Mutex::new(Default::default()));
 
 pub fn with_abbrs<R>(cb: impl FnOnce(&AbbreviationSet) -> R) -> R {
     let abbrs_g = ABBRS.lock().unwrap();
@@ -102,11 +98,11 @@ impl Abbreviation {
         if !self.matches_position(position) {
             return false;
         }
-        if !self.commands.is_empty() {
-            if !self.commands.contains(&command.to_owned()) {
-                return false;
-            }
+
+        if !self.commands.is_empty() && !self.commands.contains(&command.to_owned()) {
+            return false;
         }
+
         match &self.regex {
             Some(r) => r
                 .is_match(token.as_char_slice())
@@ -117,7 +113,7 @@ impl Abbreviation {
 
     // Return if we expand in a given position.
     fn matches_position(&self, position: Position) -> bool {
-        return self.position == Position::Anywhere || self.position == position;
+        self.position == Position::Anywhere || self.position == position
     }
 }
 
@@ -125,7 +121,6 @@ impl Abbreviation {
 #[derive(Debug, Eq, PartialEq)]
 pub struct Replacer {
     /// The string to use to replace the incoming token, either literal or as a function name.
-    /// Exposed for testing.
     pub replacement: WString,
 
     /// If true, treat 'replacement' as the name of a function.
@@ -161,7 +156,7 @@ impl Replacement {
 
             if let Some(start) = matched {
                 text.replace_range(start..(start + set_cursor_marker.len()), L!(""));
-                cursor = Some(start + range.start as usize)
+                cursor = Some(start + range.start as usize);
             }
         }
         Self {
@@ -198,7 +193,7 @@ impl AbbreviationSet {
                 });
             }
         }
-        return result;
+        result
     }
 
     /// Return whether we would have at least one replacer for a given token.
@@ -217,45 +212,44 @@ impl AbbreviationSet {
             let index = self
                 .abbrs
                 .iter()
-                .position(|a| a.name == abbr.name)
-                .expect("Abbreviation not found though its name was present");
+                .position(|a| a.name == abbr.name && a.commands == abbr.commands);
 
-            self.abbrs.remove(index);
+            if let Some(idx) = index {
+                // Exact match found (name + commands), delete old abbr.
+                self.abbrs.remove(idx);
+            }
         }
         self.abbrs.push(abbr);
     }
 
     /// Rename an abbreviation. This asserts that the old name is used, and the new name is not; the
     /// caller should check these beforehand with has_name().
-    pub fn rename(&mut self, old_name: &wstr, new_name: &wstr) {
-        let erased = self.used_names.remove(old_name);
-        let inserted = self.used_names.insert(new_name.to_owned());
-        assert!(
-            erased && inserted,
-            "Old name not found or new name already present"
-        );
-        for abbr in self.abbrs.iter_mut() {
-            if abbr.name == old_name {
-                abbr.name = new_name.to_owned();
-                break;
-            }
-        }
+    pub fn rename(&mut self, old_name: &wstr, new_name: &wstr, commands: &[WString]) {
+        self.abbrs
+            .iter_mut()
+            .find(|a| a.name == old_name && a.commands == commands)
+            .expect("Abbreviation to rename was not found.")
+            .name = new_name.to_owned();
+
+        self.used_names.insert(new_name.to_owned());
+        self.on_remove(old_name);
     }
 
-    /// Erase an abbreviation by name.
+    /// Erase an abbreviation by name and command restrictions.
     /// Return true if erased, false if not found.
-    pub fn erase(&mut self, name: &wstr) -> bool {
-        let erased = self.used_names.remove(name);
-        if !erased {
+    pub fn erase(&mut self, name: &wstr, commands: &[WString]) -> bool {
+        let Some(idx) = self
+            .abbrs
+            .iter()
+            .position(|a| a.name == name && a.commands == commands)
+        else {
             return false;
-        }
-        for (index, abbr) in self.abbrs.iter().enumerate().rev() {
-            if abbr.name == name {
-                self.abbrs.remove(index);
-                return true;
-            }
-        }
-        panic!("Unable to find named abbreviation");
+        };
+
+        self.abbrs.remove(idx);
+        self.on_remove(name);
+
+        true
     }
 
     /// Return true if we have an abbreviation with the given name.
@@ -267,6 +261,16 @@ impl AbbreviationSet {
     pub fn list(&self) -> &[Abbreviation] {
         &self.abbrs
     }
+
+    /// Checks if any other abbreviation still uses name, removing it from used_names if not
+    fn on_remove(&mut self, name: &wstr) {
+        if self.abbrs.iter().any(|a| a.name == name) {
+            return;
+        }
+
+        let removed = self.used_names.remove(name);
+        assert!(removed, "Name was not in used_names but should have been");
+    }
 }
 
 /// Return the list of replacers for an input token, in priority order, using the global set.
@@ -277,41 +281,180 @@ pub fn abbrs_match(token: &wstr, position: Position, cmd: &wstr) -> Vec<Replacer
         .collect()
 }
 
-#[test]
-#[serial]
-fn rename_abbrs() {
-    let _cleanup = test_init();
-    use crate::abbrs::{Abbreviation, Position};
-    use crate::wchar::prelude::*;
+#[cfg(test)]
+mod tests {
+    use super::{Abbreviation, Position, abbrs_get_set, abbrs_match, with_abbrs_mut};
+    use crate::editable_line::{Edit, apply_edit};
+    use crate::highlight::HighlightSpec;
+    use crate::prelude::*;
+    use crate::reader::reader_expand_abbreviation_at_cursor;
+    use crate::tests::prelude::*;
 
-    with_abbrs_mut(|abbrs_g| {
-        let mut add = |name: &wstr, repl: &wstr, position: Position| {
-            abbrs_g.add(Abbreviation {
-                name: name.into(),
-                key: name.into(),
-                regex: None,
-                commands: vec![],
-                replacement: repl.into(),
-                replacement_is_function: false,
-                position,
-                set_cursor_marker: None,
-                from_universal: false,
-            })
-        };
-        add(L!("gc"), L!("git checkout"), Position::Command);
-        add(L!("foo"), L!("bar"), Position::Command);
-        add(L!("gx"), L!("git checkout"), Position::Command);
-        add(L!("yin"), L!("yang"), Position::Anywhere);
+    #[test]
+    #[serial]
+    fn test_abbreviations() {
+        test_init();
+        let parser = &mut TestParser::new();
+        {
+            let mut abbrs = abbrs_get_set();
+            abbrs.add(Abbreviation::new(
+                L!("gc").to_owned(),
+                L!("gc").to_owned(),
+                L!("git checkout").to_owned(),
+                Position::Command,
+                false,
+            ));
+            abbrs.add(Abbreviation::new(
+                L!("foo").to_owned(),
+                L!("foo").to_owned(),
+                L!("bar").to_owned(),
+                Position::Command,
+                false,
+            ));
+            abbrs.add(Abbreviation::new(
+                L!("gx").to_owned(),
+                L!("gx").to_owned(),
+                L!("git checkout").to_owned(),
+                Position::Command,
+                false,
+            ));
+            abbrs.add(Abbreviation::new(
+                L!("yin").to_owned(),
+                L!("yin").to_owned(),
+                L!("yang").to_owned(),
+                Position::Anywhere,
+                false,
+            ));
+        }
 
-        assert!(!abbrs_g.has_name(L!("gcc")));
-        assert!(abbrs_g.has_name(L!("gc")));
+        // Helper to expand an abbreviation, enforcing we have no more than one result.
+        macro_rules! abbr_expand_1 {
+            ($token:expr, $position:expr) => {
+                let result = abbrs_match(L!($token), $position, L!(""));
+                assert_eq!(result, vec![]);
+            };
+            ($token:expr, $position:expr, $expected:expr) => {
+                let result = abbrs_match(L!($token), $position, L!(""));
+                assert_eq!(
+                    result
+                        .into_iter()
+                        .map(|a| a.replacement)
+                        .collect::<Vec<_>>(),
+                    vec![L!($expected).to_owned()]
+                );
+            };
+        }
 
-        abbrs_g.rename(L!("gc"), L!("gcc"));
-        assert!(abbrs_g.has_name(L!("gcc")));
-        assert!(!abbrs_g.has_name(L!("gc")));
+        let cmd = Position::Command;
+        abbr_expand_1!("", cmd);
+        abbr_expand_1!("nothing", cmd);
 
-        assert!(!abbrs_g.erase(L!("gc")));
-        assert!(abbrs_g.erase(L!("gcc")));
-        assert!(!abbrs_g.erase(L!("gcc")));
-    })
+        abbr_expand_1!("gc", cmd, "git checkout");
+        abbr_expand_1!("foo", cmd, "bar");
+
+        let mut expand_abbreviation_in_command =
+            |cmdline: &wstr, cursor_pos: Option<usize>| -> Option<WString> {
+                let replacement = reader_expand_abbreviation_at_cursor(
+                    cmdline,
+                    cursor_pos.unwrap_or(cmdline.len()),
+                    parser,
+                )?;
+                let mut cmdline_expanded = cmdline.to_owned();
+                let mut colors = vec![HighlightSpec::new(); cmdline.len()];
+                apply_edit(
+                    &mut cmdline_expanded,
+                    &mut colors,
+                    &Edit::new(replacement.range.into(), replacement.text),
+                );
+                Some(cmdline_expanded)
+            };
+
+        macro_rules! validate {
+            ($cmdline:expr, $cursor:expr) => {{
+                let actual = expand_abbreviation_in_command(L!($cmdline), $cursor);
+                assert_eq!(actual, None);
+            }};
+            ($cmdline:expr, $cursor:expr, $expected:expr) => {{
+                let actual = expand_abbreviation_in_command(L!($cmdline), $cursor);
+                assert_eq!(actual, Some(L!($expected).to_owned()));
+            }};
+        }
+
+        validate!("just a command", Some(3));
+        validate!("gc somebranch", Some(0), "git checkout somebranch");
+
+        validate!(
+            "gc somebranch",
+            Some("gc".chars().count()),
+            "git checkout somebranch"
+        );
+
+        // Space separation.
+        validate!(
+            "gx somebranch",
+            Some("gc".chars().count()),
+            "git checkout somebranch"
+        );
+
+        validate!(
+            "echo hi ; gc somebranch",
+            Some("echo hi ; g".chars().count()),
+            "echo hi ; git checkout somebranch"
+        );
+
+        validate!(
+            "echo (echo (echo (echo (gc ",
+            Some("echo (echo (echo (echo (gc".chars().count()),
+            "echo (echo (echo (echo (git checkout "
+        );
+
+        // If commands should be expanded.
+        validate!("if gc", None, "if git checkout");
+
+        // Others should not be.
+        validate!("of gc", None);
+
+        // Other decorations generally should be.
+        validate!("command gc", None, "command git checkout");
+
+        // yin/yang expands everywhere.
+        validate!("command yin", None, "command yang");
+    }
+
+    #[test]
+    #[serial]
+    fn rename_abbrs() {
+        test_init();
+
+        with_abbrs_mut(|abbrs_g| {
+            let mut add = |name: &wstr, repl: &wstr, position: Position| {
+                abbrs_g.add(Abbreviation {
+                    name: name.into(),
+                    key: name.into(),
+                    regex: None,
+                    commands: vec![],
+                    replacement: repl.into(),
+                    replacement_is_function: false,
+                    position,
+                    set_cursor_marker: None,
+                    from_universal: false,
+                });
+            };
+            add(L!("gc"), L!("git checkout"), Position::Command);
+            add(L!("foo"), L!("bar"), Position::Command);
+            add(L!("gx"), L!("git checkout"), Position::Command);
+            add(L!("yin"), L!("yang"), Position::Anywhere);
+
+            assert!(!abbrs_g.has_name(L!("gcc")));
+            assert!(abbrs_g.has_name(L!("gc")));
+
+            abbrs_g.rename(L!("gc"), L!("gcc"), &[]);
+            assert!(abbrs_g.has_name(L!("gcc")));
+            assert!(!abbrs_g.has_name(L!("gc")));
+
+            assert!(!abbrs_g.erase(L!("gc"), &[]));
+            assert!(abbrs_g.erase(L!("gcc"), &[]));
+            assert!(!abbrs_g.erase(L!("gcc"), &[]));
+        });
+    }
 }

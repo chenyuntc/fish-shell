@@ -1,14 +1,12 @@
 name: Stable Rust Toolchain
 
-on:
-  workflow_call:
-    inputs:
-      targets:
-        description: Comma-separated list of target triples to install for this toolchain
-        required: false
-      components:
-        description: Comma-separated list of components to be additionally installed
-        required: false
+inputs:
+  targets:
+    description: Comma-separated list of target triples to install for this toolchain
+    required: false
+  components:
+    description: Comma-separated list of components to be additionally installed
+    required: false
 
 permissions:
   contents: read
@@ -16,7 +14,8 @@ permissions:
 runs:
   using: "composite"
   steps:
-    - uses: dtolnay/rust-toolchain@1.89
+    - uses: ./.github/actions/rust-toolchain
       with:
+        toolchain_channel: "stable"
         targets: ${{ inputs.targets }}
         components: ${{ inputs.components }}

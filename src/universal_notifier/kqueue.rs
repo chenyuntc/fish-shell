@@ -1,12 +1,13 @@
-use crate::common::wcs2osstring;
 use crate::env_universal_common::default_vars_path;
+use crate::fds::heightenize_fd;
+use crate::flogf;
+use crate::prelude::*;
 use crate::universal_notifier::UniversalNotifier;
-use crate::wchar::prelude::*;
 use crate::wutil::wdirname;
-use crate::FLOGF;
+use fish_widestring::wcs2osstring;
 use nix::sys::event::{EvFlags, EventFilter, FilterFlag, KEvent, Kqueue};
 use std::fs::File;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::PathBuf;
@@ -48,6 +49,7 @@ impl KqueueNotifier {
 
         // Open the directory to get a valid file descriptor or bail if it doesn't exist
         let dir_fd = File::open(dir.as_os_str()).ok()?;
+        let dir_fd = File::from(heightenize_fd(OwnedFd::from(dir_fd), true).ok()?);
 
         // Add a watch for EVFILT_VNODE events
         let change_event = KEvent::new(
@@ -67,13 +69,13 @@ impl KqueueNotifier {
         let kq = match nix::sys::event::Kqueue::new() {
             Ok(kq) => kq,
             Err(e) => {
-                FLOGF!(warning, "Failed to create kqueue: {}", e.desc());
+                flogf!(warning, "Failed to create kqueue: {}", e.desc());
                 return None;
             }
         };
         // Calling kevent with an empty event list causes it to add without watching for events.
         if let Err(e) = kq.kevent(&[change_event], &mut [], None) {
-            FLOGF!(
+            flogf!(
                 warning,
                 "Could not register fs watch event with kqueue: {}",
                 e.desc()
@@ -135,7 +137,7 @@ impl UniversalNotifier for KqueueNotifier {
                 for event in &events[..event_count] {
                     if event.flags().contains(EvFlags::EV_ERROR) {
                         // Error encountered processing this changelist item
-                        FLOGF!(
+                        flogf!(
                             warning,
                             "EV_ERROR in kqueue uvar monitor! Errno: {}",
                             event.data()
@@ -178,33 +180,27 @@ impl UniversalNotifier for KqueueNotifier {
     }
 }
 
-#[test]
-fn test_kqueue_notifiers() {
-    use crate::common::cstr2wcstring;
-    use std::ffi::CStr;
-    use std::fs::remove_dir_all;
-    use std::path::PathBuf;
+#[cfg(test)]
+mod tests {
+    use super::KqueueNotifier;
+    use crate::universal_notifier::{UniversalNotifier, test_helpers::test_notifiers};
+    use fish_widestring::WString;
 
-    let mut template: Box<[u8]> = Box::from(&b"/tmp/fish_kqueue_XXXXXX\0"[..]);
+    #[test]
+    fn test_kqueue_notifiers() {
+        let temp_dir = fish_tempfile::new_dir().unwrap();
+        let fake_uvars_path =
+            WString::from(temp_dir.path().join("fish_variables").to_str().unwrap());
 
-    let temp_dir_ptr = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
-    if temp_dir_ptr.is_null() {
-        panic!("failed to create temp dir");
+        let mut notifiers = Vec::new();
+        for _ in 0..16 {
+            notifiers
+                .push(KqueueNotifier::new_at(&fake_uvars_path).expect("failed to create notifier"));
+        }
+        let notifiers = notifiers
+            .iter()
+            .map(|n| n as &dyn UniversalNotifier)
+            .collect::<Vec<_>>();
+        test_notifiers(&notifiers, Some(&fake_uvars_path));
     }
-    let tmp_dir = unsafe { CStr::from_ptr(temp_dir_ptr) };
-    let fake_uvars_dir = cstr2wcstring(tmp_dir.to_bytes_with_nul());
-    let fake_uvars_path = fake_uvars_dir.clone() + "/fish_variables";
-
-    let mut notifiers = Vec::new();
-    for _ in 0..16 {
-        notifiers
-            .push(KqueueNotifier::new_at(&fake_uvars_path).expect("failed to create notifier"));
-    }
-    let notifiers = notifiers
-        .iter()
-        .map(|n| n as &dyn UniversalNotifier)
-        .collect::<Vec<_>>();
-    super::test_helpers::test_notifiers(&notifiers, Some(&fake_uvars_path));
-
-    let _ = remove_dir_all(PathBuf::from(wcs2osstring(&fake_uvars_dir)));
 }

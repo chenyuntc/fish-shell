@@ -180,7 +180,8 @@ if string match -q Darwin -- (__fish_uname) && string match -q /usr/bin/git -- (
     else
         # git is installed, but on the first run it may be very slow as xcrun needs to populate the cache.
         # Kick it off in the background to populate the cache.
-        /bin/sh -c '( /usr/bin/git --version; touch /tmp/__fish_git_ready ) >/dev/null 2>&1 &'
+        set -l sh (__fish_posix_shell)
+        $sh -c '( /usr/bin/git --version; touch /tmp/__fish_git_ready ) >/dev/null 2>&1 &'
         function __fish_git_prompt_ready
             path is /tmp/__fish_git_ready || return 1
             # git is ready, erase the function.
@@ -297,7 +298,10 @@ function fish_git_prompt --description "Prompt function for Git"
                 test "$untracked" = true; and set opt -unormal
                 # Don't use `--ignored=no`; it was introduced in Git 2.16, from January 2018
                 # Ignored files are omitted by default
-                set -l stat (command git -c core.fsmonitor= status --porcelain -z $opt | string split0)
+                # Renames and copies in porcelain -z output have an extra NUL-delimited
+                # field for the source path. Filter to entries starting with a valid
+                # two-char status code followed by a space to skip those bare paths.
+                set -l stat (__fish_git_prompt_status_porcelain_modulo_rename_source $opt)
 
                 set dirtystate (string match -qr '^.[ACDMRTU]' -- $stat; and echo 1)
                 if test -n "$sha"
@@ -403,6 +407,20 @@ end
 
 ### helper functions
 
+function __fish_git_prompt_status_porcelain_modulo_rename_source
+    set -l skip false
+    for line in (git -c core.fsmonitor= status --porcelain -z $argv | string split0)
+        if $skip
+            set skip false
+            continue
+        end
+        printf %s\n $line
+        if string match -rq -- ^[RC] $line
+            set skip true
+        end
+    end
+end
+
 function __fish_git_prompt_informative_status
     set -l stashstate 0
     set -l stashfile "$argv[1]/logs/refs/stash"
@@ -420,7 +438,10 @@ function __fish_git_prompt_informative_status
 
     # Use git status --porcelain.
     # The v2 format is better, but we don't actually care in this case.
-    set -l stats (string sub -l 2 (git -c core.fsmonitor= status --porcelain -z $untr | string split0))
+    # Renames and copies in porcelain -z output have an extra NUL-delimited
+    # field for the source path. Filter to entries starting with a valid
+    # two-char status code followed by a space to skip those bare paths.
+    set -l stats (__fish_git_prompt_status_porcelain_modulo_rename_source $untr)
     set -l invalidstate (string match -r '^UU' $stats | count)
     set -l stagedstate (string match -r '^[ACDMRT].' $stats | count)
     set -l dirtystate (string match -r '^.[ACDMRT]' $stats | count)
@@ -514,15 +535,15 @@ function __fish_git_prompt_operation_branch_bare --description "fish_git_prompt 
         if not set branch (command git symbolic-ref HEAD 2>/dev/null)
             set detached yes
             set branch (switch "$__fish_git_prompt_describe_style"
-						case contains
-							command git describe --contains HEAD
-						case branch
-							command git describe --contains --all HEAD
-						case describe
-							command git describe HEAD
-						case default '*'
-							command git describe --tags --exact-match HEAD
-						end 2>/dev/null)
+                        case contains
+                            command git describe --contains HEAD
+                        case branch
+                            command git describe --contains --all HEAD
+                        case describe
+                            command git describe HEAD
+                        case default '*'
+                            command git describe --tags --exact-match HEAD
+                        end 2>/dev/null)
             if test $status -ne 0
                 # Shorten the sha ourselves to 8 characters - this should be good for most repositories,
                 # and even for large ones it should be good for most commits
@@ -586,7 +607,7 @@ function __fish_git_prompt_validate_chars --description "fish_git_prompt helper,
     __fish_git_prompt_set_char __fish_git_prompt_char_untrackedfiles '%' '…'
     __fish_git_prompt_set_char __fish_git_prompt_char_upstream_ahead '>' '↑'
     __fish_git_prompt_set_char __fish_git_prompt_char_upstream_behind '<' '↓'
-    __fish_git_prompt_set_char __fish_git_prompt_char_upstream_diverged '<>'
+    __fish_git_prompt_set_char __fish_git_prompt_char_upstream_diverged '<>' '↓↑'
     __fish_git_prompt_set_char __fish_git_prompt_char_upstream_equal '='
     __fish_git_prompt_set_char __fish_git_prompt_char_upstream_prefix ''
 
@@ -595,14 +616,16 @@ end
 function __fish_git_prompt_set_color
     set -l user_variable_name "$argv[1]"
 
-    set -l default default_done
+    set -l default
+    set -l default_done
+
     switch (count $argv)
         case 1 # No defaults given, use prompt color
             set default $___fish_git_prompt_color
             set default_done $___fish_git_prompt_color_done
-        case 2 # One default given, use normal for done
+        case 2 # One default given, use "--reset" for done
             set default "$argv[2]"
-            set default_done (set_color normal)
+            set default_done (set_color --reset)
         case 3 # Both defaults given
             set default "$argv[2]"
             set default_done "$argv[3]"
@@ -614,7 +637,7 @@ function __fish_git_prompt_set_color
     if not set -q $variable
         if test -n "$$user_variable_name"
             set -g $variable (set_color $$user_variable_name)
-            set -g $variable_done (set_color normal)
+            set -g $variable_done (set_color --reset)
         else
             set -g $variable $default
             set -g $variable_done $default_done
@@ -660,31 +683,25 @@ end
 
 function __fish_git_prompt_reset -a type -a op -a var --description "Event handler, resets prompt when functionality changes" \
     --on-variable=__fish_git_prompt_{show_informative_status,use_informative_chars}
-    if status --is-interactive
-        # Clear characters that have different defaults with/without informative status
-        set -e ___fish_git_prompt_char_{name,cleanstate,dirtystate,invalidstate,stagedstate,stashstate,stateseparator,untrackedfiles,upstream_ahead,upstream_behind}
-        # Clear init so we reset the chars next time.
-        set -e ___fish_git_prompt_init
-    end
+    # Clear characters that have different defaults with/without informative status
+    set -e ___fish_git_prompt_char_{name,cleanstate,dirtystate,invalidstate,stagedstate,stashstate,stateseparator,untrackedfiles,upstream_ahead,upstream_behind}
+    # Clear init so we reset the chars next time.
+    set -e ___fish_git_prompt_init
 end
 
 function __fish_git_prompt_reset_color -a type -a op -a var --description "Event handler, resets prompt when any color changes" \
     --on-variable=__fish_git_prompt_color{'',_prefix,_suffix,_bare,_merging,_cleanstate,_invalidstate,_upstream,_flags,_branch,_dirtystate,_stagedstate,_branch_detached,_stashstate,_untrackedfiles} --on-variable=__fish_git_prompt_showcolorhints
-    if status --is-interactive
-        set -e _$var
-        set -e _{$var}_done
-        set -e ___fish_git_prompt_init
-        if contains -- $var __fish_git_prompt_color __fish_git_prompt_color_flags __fish_git_prompt_showcolorhints
-            # reset all the other colors too
-            set -e ___fish_git_prompt_color_{prefix,suffix,bare,merging,branch,dirtystate,stagedstate,invalidstate,stashstate,untrackedfiles,upstream,flags}{,_done}
-        end
+    set -e _$var
+    set -e _{$var}_done
+    set -e ___fish_git_prompt_init
+    if contains -- $var __fish_git_prompt_color __fish_git_prompt_color_flags __fish_git_prompt_showcolorhints
+        # reset all the other colors too
+        set -e ___fish_git_prompt_color_{prefix,suffix,bare,merging,branch,dirtystate,stagedstate,invalidstate,stashstate,untrackedfiles,upstream,flags}{,_done}
     end
 end
 
 function __fish_git_prompt_reset_char -a type -a op -a var --description "Event handler, resets prompt when any char changes" \
     --on-variable=__fish_git_prompt_char_{cleanstate,dirtystate,invalidstate,stagedstate,stashstate,stateseparator,untrackedfiles,upstream_ahead,upstream_behind,upstream_diverged,upstream_equal,upstream_prefix}
-    if status --is-interactive
-        set -e ___fish_git_prompt_init
-        set -e _$var
-    end
+    set -e ___fish_git_prompt_init
+    set -e _$var
 end

@@ -38,7 +38,7 @@ type sh
 type realpath | grep -v "^  *"
 # CHECK: realpath is a function with definition
 # CHECK: # Defined in {{.*}}functions/realpath.fish @ line {{\d+}}
-# CHECK: function realpath --description {{.+}}
+# CHECK: function realpath
 # CHECK: end
 
 type -t realpath foobar
@@ -135,8 +135,17 @@ type -p other-test-type3
 type -s other-test-type3
 # CHECK: other-test-type3 is a function (Defined via `source`, copied via `source`)
 
-touch ./test
-chmod +x ./test
+if cygwin_noacl ./
+    # In `noacl` mounts, Cygwin relies on the file content to set the `x` bit
+    # and ignores `chmod`
+    echo "#!/bin/sh" >./test
+else
+    touch ./test
+    chmod +x ./test
+end
 
 PATH=.:$PATH type -P test
 # CHECK: ./test
+
+type -p -q type
+# CHECKERR: type: invalid option combination

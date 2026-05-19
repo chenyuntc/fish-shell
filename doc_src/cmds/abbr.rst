@@ -1,5 +1,3 @@
-.. _cmd-abbr:
-
 abbr - manage fish abbreviations
 ================================
 
@@ -10,9 +8,9 @@ Synopsis
 
     abbr --add NAME [--position command | anywhere] [-r | --regex PATTERN] [-c | --command COMMAND]
                     [--set-cursor[=MARKER]] ([-f | --function FUNCTION] | EXPANSION)
-    abbr --erase NAME ...
-    abbr --rename OLD_WORD NEW_WORD
-    abbr --show
+    abbr --erase [ [-c | --command COMMAND]... ] NAME ...
+    abbr --rename [ [-c | --command COMMAND]... ] OLD_WORD NEW_WORD
+    abbr [--show] [--color WHEN]
     abbr --list
     abbr --query NAME ...
 
@@ -48,7 +46,7 @@ Combining these features, it is possible to create custom syntaxes, where a regu
 
      > abbr >> ~/.config/fish/config.fish
      > abbr --erase (abbr --list)
-   
+
    Alternatively you can keep them in a separate :ref:`configuration file <configuration>` by doing something like the following::
 
      > abbr > ~/.config/fish/conf.d/myabbrs.fish
@@ -76,7 +74,6 @@ With **--regex**, the abbreviation matches using the regular expression given by
 With **--set-cursor=MARKER**, the cursor is moved to the first occurrence of **MARKER** in the expansion. The **MARKER** value is erased. The **MARKER** may be omitted (i.e. simply ``--set-cursor``), in which case it defaults to ``%``.
 
 With **-f FUNCTION** or **--function FUNCTION**, **FUNCTION** is treated as the name of a fish function instead of a literal replacement. When the abbreviation matches, the function will be called with the matching token as an argument. If the function's exit status is 0 (success), the token will be replaced by the function's output; otherwise the token will be left unchanged. No **EXPANSION** may be given separately.
-
 
 Examples
 ########
@@ -136,9 +133,10 @@ Other subcommands
 
 ::
 
-    abbr --rename OLD_NAME NEW_NAME
+    abbr --rename [ [-c | --command COMMAND]... ] OLD_NAME NEW_NAME
 
-Renames an abbreviation, from *OLD_NAME* to *NEW_NAME*
+Renames an abbreviation, from *OLD_NAME* to *NEW_NAME*.
+For command-specific abbreviations, the ``--command`` options must be provided to disambiguate which abbreviation to rename.
 
 ::
 
@@ -154,9 +152,10 @@ Prints the names of all abbreviation
 
 ::
 
-    abbr [-e | --erase] NAME
+    abbr [-e | --erase] [ [-c | --command COMMAND]... ] NAME ...
 
-Erases the abbreviation with the given name
+Erases the abbreviation with the given name.
+For command-specific abbreviations, the ``--command`` options must be provided to disambiguate which abbreviation to rename.
 
 ::
 

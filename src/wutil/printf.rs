@@ -4,7 +4,7 @@ macro_rules! sprintf {
     // Allow a `&str` or `&Utf32Str` as a format, and return a `Utf32String`.
     ($fmt:expr $(, $arg:expr)* $(,)?) => {
         {
-            let mut target = widestring::Utf32String::new();
+            let mut target = fish_widestring::WString::new();
             $crate::sprintf!(=> &mut target, $fmt, $($arg),*);
             target
         }
@@ -26,7 +26,7 @@ macro_rules! fprintf {
     ($fd:expr, $fmt:expr $(, $arg:expr)* $(,)?) => {
         {
             let wide = $crate::wutil::sprintf!($fmt, $( $arg ),*);
-            $crate::wutil::wwrite_to_fd(&wide, $fd);
+            $crate::wutil::unescape_bytes_and_write_to_fd(&wide, $fd);
         }
     }
 }
@@ -51,13 +51,9 @@ pub use {eprintf, fprintf, printf, sprintf};
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     // Test basic sprintf with both literals and wide strings.
     #[test]
     fn test_sprintf() {
         assert_eq!(sprintf!("Hello, %s!", "world"), "Hello, world!");
-        assert_eq!(sprintf!("Hello, %ls!", "world"), "Hello, world!");
-        assert_eq!(sprintf!("Hello, %ls!", "world"), "Hello, world!");
     }
 }

@@ -1,30 +1,24 @@
 use super::wopendir;
-use crate::common::{str2wcstring, wcs2zstring};
-use crate::wchar::{wstr, WString};
 use crate::wutil::DevInode;
+use cfg_if::cfg_if;
+use fish_widestring::{WString, bytes2wcstring, wcs2zstring, wstr};
 use libc::{
-    DT_BLK, DT_CHR, DT_DIR, DT_FIFO, DT_LNK, DT_REG, DT_SOCK, EACCES, EIO, ELOOP, ENAMETOOLONG,
-    ENODEV, ENOENT, ENOTDIR, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG,
-    S_IFSOCK,
+    EACCES, EIO, ELOOP, ENAMETOOLONG, ENODEV, ENOENT, ENOTDIR, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO,
+    S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK,
 };
-use std::cell::Cell;
-use std::io;
-use std::mem::MaybeUninit;
-use std::os::fd::RawFd;
-use std::ptr::{addr_of, NonNull};
-use std::rc::Rc;
+use std::{cell::Cell, io, mem::MaybeUninit, os::fd::RawFd, ptr::NonNull, rc::Rc};
 
 /// Types of files that may be in a directory.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DirEntryType {
-    fifo = 1, // FIFO file
-    chr,      // character device
-    dir,      // directory
-    blk,      // block device
-    reg,      // regular file
-    lnk,      // symlink
-    sock,     // socket
-    whiteout, // whiteout (from BSD)
+    Fifo = 1, // FIFO file
+    Chr,      // character device
+    Dir,      // directory
+    Blk,      // block device
+    Reg,      // regular file
+    Lnk,      // symlink
+    Sock,     // socket
+    Whiteout, // whiteout (from BSD)
 }
 
 /// An entry returned by DirIter.
@@ -53,7 +47,8 @@ pub struct DirEntry {
 
 impl DirEntry {
     /// Return the type of this entry if it is already available, otherwise none().
-    pub fn fast_type(&self) -> Option<DirEntryType> {
+    #[cfg(test)]
+    fn fast_type(&self) -> Option<DirEntryType> {
         self.typ.get()
     }
 
@@ -63,14 +58,14 @@ impl DirEntry {
     pub fn check_type(&self) -> Option<DirEntryType> {
         // Call stat if needed to populate our type, swallowing errors.
         if self.typ.get().is_none() {
-            self.do_stat()
+            self.do_stat();
         }
         self.typ.get()
     }
 
     /// Return whether this is a directory. This may call stat().
     pub fn is_dir(&self) -> bool {
-        self.check_type() == Some(DirEntryType::dir)
+        self.check_type() == Some(DirEntryType::Dir)
     }
 
     /// Return false if we know this can't be a link via d_type, true if it could be.
@@ -117,7 +112,7 @@ impl DirEntry {
         } else {
             match errno::errno().0 {
                 ELOOP => {
-                    self.typ.set(Some(DirEntryType::lnk));
+                    self.typ.set(Some(DirEntryType::Lnk));
                 }
                 EACCES | EIO | ENOENT | ENOTDIR | ENAMETOOLONG | ENODEV => {
                     // These are "expected" errors.
@@ -136,15 +131,16 @@ impl DirEntry {
     }
 }
 
+#[cfg(not(target_os = "illumos"))]
 fn dirent_type_to_entry_type(dt: u8) -> Option<DirEntryType> {
     match dt {
-        DT_FIFO => Some(DirEntryType::fifo),
-        DT_CHR => Some(DirEntryType::chr),
-        DT_DIR => Some(DirEntryType::dir),
-        DT_BLK => Some(DirEntryType::blk),
-        DT_REG => Some(DirEntryType::reg),
-        DT_LNK => Some(DirEntryType::lnk),
-        DT_SOCK => Some(DirEntryType::sock),
+        libc::DT_FIFO => Some(DirEntryType::Fifo),
+        libc::DT_CHR => Some(DirEntryType::Chr),
+        libc::DT_DIR => Some(DirEntryType::Dir),
+        libc::DT_BLK => Some(DirEntryType::Blk),
+        libc::DT_REG => Some(DirEntryType::Reg),
+        libc::DT_LNK => Some(DirEntryType::Lnk),
+        libc::DT_SOCK => Some(DirEntryType::Sock),
         // todo!("whiteout")
         _ => None,
     }
@@ -152,13 +148,13 @@ fn dirent_type_to_entry_type(dt: u8) -> Option<DirEntryType> {
 
 fn stat_mode_to_entry_type(m: libc::mode_t) -> Option<DirEntryType> {
     match m & S_IFMT {
-        S_IFIFO => Some(DirEntryType::fifo),
-        S_IFCHR => Some(DirEntryType::chr),
-        S_IFDIR => Some(DirEntryType::dir),
-        S_IFBLK => Some(DirEntryType::blk),
-        S_IFREG => Some(DirEntryType::reg),
-        S_IFLNK => Some(DirEntryType::lnk),
-        S_IFSOCK => Some(DirEntryType::sock),
+        S_IFIFO => Some(DirEntryType::Fifo),
+        S_IFCHR => Some(DirEntryType::Chr),
+        S_IFDIR => Some(DirEntryType::Dir),
+        S_IFBLK => Some(DirEntryType::Blk),
+        S_IFREG => Some(DirEntryType::Reg),
+        S_IFLNK => Some(DirEntryType::Lnk),
+        S_IFSOCK => Some(DirEntryType::Sock),
         _ => {
             // todo!("whiteout")
             None
@@ -267,15 +263,15 @@ impl DirIter {
         };
 
         // dent.d_name is c_char; pretend it's u8.
-        assert!(std::mem::size_of::<libc::c_char>() == std::mem::size_of::<u8>());
+        const {
+            assert!(size_of::<libc::c_char>() == size_of::<u8>());
+        }
 
         // Do not rely on `libc::dirent::d_name.len()` as dirent names may exceed
         // the nominal buffer size; instead use the terminating nul byte.
-        // TODO: This should use &raw from Rust 1.82 on
         // https://github.com/rust-lang/libc/issues/2669
         // https://github.com/fish-shell/fish-shell/issues/11221
-        let d_name_ptr = addr_of!(dent.d_name);
-        let d_name = unsafe { std::ffi::CStr::from_ptr(d_name_ptr.cast()) }.to_bytes();
+        let d_name = unsafe { std::ffi::CStr::from_ptr(dent.d_name.as_ptr().cast()) }.to_bytes();
 
         // Skip . and ..,
         // unless we've been told not to.
@@ -284,22 +280,31 @@ impl DirIter {
         }
 
         self.entry.reset();
-        self.entry.name = str2wcstring(d_name);
-        #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-        {
-            self.entry.inode = dent.d_fileno;
-        }
-        #[cfg(not(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd")))]
-        {
-            self.entry.inode = dent.d_ino;
-        }
-        let typ = dirent_type_to_entry_type(dent.d_type);
+        self.entry.name = bytes2wcstring(d_name);
+        cfg_if!(
+            if #[cfg(bsd)] {
+                self.entry.inode = dent.d_fileno;
+            } else {
+                self.entry.inode = dent.d_ino;
+            }
+        );
+
+        cfg_if!(
+            if #[cfg(target_os = "illumos")] {
+                // illumos doesn't have .d_type
+                // https://github.com/illumos/illumos-gate/blob/af641d205ecf080be0d900f89c4f3d2adb84f33f/usr/src/uts/common/sys/dirent.h#L44
+                let typ = None;
+            } else {
+                let typ = dirent_type_to_entry_type(dent.d_type);
+            }
+        );
+
         // Do not store symlinks as we will need to resolve them.
-        if typ != Some(DirEntryType::lnk) {
+        if typ != Some(DirEntryType::Lnk) {
             self.entry.typ.set(typ);
         }
         // This entry could be a link if it is a link or unknown.
-        self.entry.possible_link = typ.map(|t| t == DirEntryType::lnk);
+        self.entry.possible_link = typ.map(|t| t == DirEntryType::Lnk);
 
         Some(Ok(&self.entry))
     }
@@ -326,160 +331,154 @@ impl Iterator for Iter {
     }
 }
 
-#[test]
-fn test_dir_iter_bad_path() {
-    // Regression test: DirIter does not crash given a bad path.
-    use crate::wchar::L;
-    let dir = DirIter::new(L!("/a/bogus/path/which/does/notexist"));
-    assert!(dir.is_err());
-}
+#[cfg(test)]
+mod tests {
+    use super::{DirEntryType, DirIter};
+    use crate::prelude::*;
+    use assert_matches::assert_matches;
+    use fish_widestring::L;
+    use nix::sys::stat::Mode;
+    use std::fs::File;
+    use std::path::PathBuf;
 
-#[test]
-fn test_no_dots() {
-    use crate::wchar::L;
-    // DirIter does not return . or .. by default.
-    let dir = DirIter::new(L!(".")).expect("Should be able to open CWD");
-    for entry in dir {
-        let entry = entry.unwrap();
-        assert_ne!(entry.name, ".");
-        assert_ne!(entry.name, "..");
+    #[test]
+    fn test_dir_iter_bad_path() {
+        // Regression test: DirIter does not crash given a bad path.
+        let dir = DirIter::new(L!("/a/bogus/path/which/does/notexist"));
+        assert!(dir.is_err());
     }
-}
 
-#[test]
-fn test_dots() {
-    use crate::wchar::L;
-    // DirIter returns . or .. if you ask nicely.
-    let dir = DirIter::new_with_dots(L!(".")).expect("Should be able to open CWD");
-    let mut seen_dot = false;
-    let mut seen_dotdot = false;
-    for entry in dir {
-        let entry = entry.unwrap();
-        if entry.name == "." {
-            seen_dot = true;
-        } else if entry.name == ".." {
-            seen_dotdot = true;
+    #[test]
+    fn test_no_dots() {
+        // DirIter does not return . or .. by default.
+        let dir = DirIter::new(L!(".")).expect("Should be able to open CWD");
+        for entry in dir {
+            let entry = entry.unwrap();
+            assert_ne!(entry.name, ".");
+            assert_ne!(entry.name, "..");
         }
     }
-    assert!(seen_dot);
-    assert!(seen_dotdot);
-}
 
-// Test ported from C++.
-#[test]
-#[allow(clippy::if_same_then_else)]
-fn test_dir_iter() {
-    use crate::common::charptr2wcstring;
-    use crate::common::wcs2osstring;
-    use crate::wchar::L;
-    use libc::{close, mkfifo, open, symlink, O_CREAT, O_WRONLY};
-    use std::ffi::CString;
-
-    let baditer = DirIter::new(L!("/definitely/not/a/valid/directory/for/sure"));
-    assert!(baditer.is_err());
-    let Err(err) = baditer else {
-        panic!("Expected error");
-    };
-    let err = err.raw_os_error().expect("Should have an errno value");
-    assert!(err == ENOENT || err == EACCES);
-
-    let mut t1: [u8; 31] = *b"/tmp/fish_test_dir_iter.XXXXXX\0";
-    let basepath_narrow = unsafe { libc::mkdtemp(t1.as_mut_ptr().cast()) };
-    assert!(!basepath_narrow.is_null(), "mkdtemp failed");
-    let basepath: WString = charptr2wcstring(basepath_narrow);
-
-    let makepath = |s: &str| -> CString {
-        let mut tmp = basepath.clone();
-        tmp.push('/');
-        tmp.push_str(s);
-        wcs2zstring(&tmp)
-    };
-
-    let dirname = "dir";
-    let regname = "reg";
-    let reglinkname = "reglink"; // link to regular file
-    let dirlinkname = "dirlink"; // link to directory
-    let badlinkname = "badlink"; // link to nowhere
-    let selflinkname = "selflink"; // link to self
-    let fifoname = "fifo";
-    #[rustfmt::skip]
-    let names = &[
-        dirname, regname, reglinkname, dirlinkname,
-        badlinkname, selflinkname, fifoname,
-    ];
-
-    let is_link_name = |name: &wstr| -> bool {
-        name == reglinkname || name == dirlinkname || name == badlinkname || name == selflinkname
-    };
-
-    // Make our different file types
-    unsafe {
-        let mut ret = libc::mkdir(makepath(dirname).as_ptr(), 0o700);
-        assert!(ret == 0);
-        ret = open(makepath(regname).as_ptr(), O_CREAT | O_WRONLY, 0o600);
-        assert!(ret >= 0);
-        close(ret);
-        ret = symlink(makepath(regname).as_ptr(), makepath(reglinkname).as_ptr());
-        assert!(ret == 0);
-        ret = symlink(makepath(dirname).as_ptr(), makepath(dirlinkname).as_ptr());
-        assert!(ret == 0);
-        ret = symlink(
-            b"/this/is/an/invalid/path\0".as_ptr().cast(),
-            makepath(badlinkname).as_ptr(),
-        );
-        assert!(ret == 0);
-        ret = symlink(
-            makepath(selflinkname).as_ptr(),
-            makepath(selflinkname).as_ptr(),
-        );
-        assert!(ret == 0);
-        ret = mkfifo(makepath(fifoname).as_ptr(), 0o600);
-        assert!(ret == 0);
+    #[test]
+    fn test_dots() {
+        // DirIter returns . or .. if you ask nicely.
+        let dir = DirIter::new_with_dots(L!(".")).expect("Should be able to open CWD");
+        let mut seen_dot = false;
+        let mut seen_dotdot = false;
+        for entry in dir {
+            let entry = entry.unwrap();
+            if entry.name == "." {
+                seen_dot = true;
+            } else if entry.name == ".." {
+                seen_dotdot = true;
+            }
+        }
+        assert!(seen_dot);
+        assert!(seen_dotdot);
     }
 
-    let mut iter1 = DirIter::new(&basepath).expect("Should be able to open directory");
-    let mut seen = 0;
-    while let Some(entry) = iter1.next() {
-        let entry = entry.expect("Should not have gotten error");
-        seen += 1;
-        assert!(entry.name != "." && entry.name != "..");
-        assert!(names.iter().any(|&n| entry.name == n));
+    #[test]
+    #[allow(clippy::if_same_then_else)]
+    fn test_dir_iter() {
+        use libc::{EACCES, ENOENT};
 
-        let expected = if entry.name == dirname {
-            Some(DirEntryType::dir)
-        } else if entry.name == regname {
-            Some(DirEntryType::reg)
-        } else if entry.name == reglinkname {
-            Some(DirEntryType::reg)
-        } else if entry.name == dirlinkname {
-            Some(DirEntryType::dir)
-        } else if entry.name == badlinkname {
-            None
-        } else if entry.name == selflinkname {
-            Some(DirEntryType::lnk)
-        } else if entry.name == fifoname {
-            Some(DirEntryType::fifo)
+        let baditer = DirIter::new(L!("/definitely/not/a/valid/directory/for/sure"));
+        assert!(baditer.is_err());
+        let Err(err) = baditer else {
+            panic!("Expected error");
+        };
+        let err = err.raw_os_error().expect("Should have an errno value");
+        assert_matches!(err, ENOENT | EACCES);
+
+        let temp_dir = fish_tempfile::new_dir().unwrap();
+        let basepath = WString::from(temp_dir.path().to_str().unwrap());
+
+        let makepath = |s: &str| -> PathBuf { temp_dir.path().join(s) };
+
+        let dirname = "dir";
+        let regname = "reg";
+        let reglinkname = "reglink"; // link to regular file
+        let dirlinkname = "dirlink"; // link to directory
+        let badlinkname = "badlink"; // link to nowhere
+        let selflinkname = "selflink"; // link to self
+        let fifoname = "fifo";
+        #[rustfmt::skip]
+        let names = if cfg!(not(cygwin)) {
+            vec![
+                dirname, regname, reglinkname, dirlinkname,
+                badlinkname, selflinkname, fifoname,
+            ]
         } else {
-            panic!("Unexpected file type");
+            // Symbolic links on Windows are complicated. Their behavior depends
+            // on the CYGWIN or MSYS env variable. So we skip that part of the test
+            vec![dirname, regname, fifoname]
         };
 
-        // Links should never have a fast type if we are resolving them, since we cannot resolve a
-        // symlink from readdir.
-        if is_link_name(&entry.name) {
-            assert!(entry.fast_type().is_none());
-        }
-        // If we have a fast type, it should be correct.
-        assert!(entry.fast_type().is_none() || entry.fast_type() == expected);
-        assert!(
-            entry.check_type() == expected,
-            "Wrong type for {}. Expected {:?}, got {:?}",
-            entry.name,
-            expected,
-            entry.check_type()
-        );
-    }
-    assert_eq!(seen, names.len());
+        #[cfg(not(cygwin))]
+        let is_link_name = |name: &wstr| -> bool {
+            name == reglinkname
+                || name == dirlinkname
+                || name == badlinkname
+                || name == selflinkname
+        };
 
-    // Clean up.
-    let _ = std::fs::remove_dir_all(wcs2osstring(&basepath));
+        // Make our different file types
+        nix::unistd::mkdir(&makepath(dirname), Mode::from_bits(0o700).unwrap()).unwrap();
+        File::create(makepath(regname)).unwrap();
+        #[cfg(not(cygwin))]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink(makepath(regname), makepath(reglinkname)).unwrap();
+            symlink(makepath(dirname), makepath(dirlinkname)).unwrap();
+            symlink("/this/is/an/invalid/path", makepath(badlinkname)).unwrap();
+            symlink(makepath(selflinkname), makepath(selflinkname)).unwrap();
+        }
+        nix::unistd::mkfifo(&makepath(fifoname), Mode::from_bits(0o600).unwrap()).unwrap();
+
+        let mut iter1 = DirIter::new(&basepath).expect("Should be able to open directory");
+        let mut seen = 0;
+        while let Some(entry) = iter1.next() {
+            let entry = entry.expect("Should not have gotten error");
+            seen += 1;
+            assert!(entry.name != "." && entry.name != "..");
+            assert!(names.iter().any(|&n| entry.name == n));
+
+            let expected = if entry.name == dirname {
+                Some(DirEntryType::Dir)
+            } else if entry.name == regname {
+                Some(DirEntryType::Reg)
+            } else if entry.name == reglinkname {
+                Some(DirEntryType::Reg)
+            } else if entry.name == dirlinkname {
+                Some(DirEntryType::Dir)
+            } else if entry.name == badlinkname {
+                None
+            } else if entry.name == selflinkname {
+                Some(DirEntryType::Lnk)
+            } else if entry.name == fifoname {
+                Some(DirEntryType::Fifo)
+            } else {
+                panic!("Unexpected file type");
+            };
+
+            // Links should never have a fast type if we are resolving them, since we cannot resolve a
+            // symlink from readdir.
+            #[cfg(not(cygwin))]
+            if is_link_name(&entry.name) {
+                assert!(entry.fast_type().is_none());
+            }
+            // If we have a fast type, it should be correct.
+            assert!(entry.fast_type().is_none() || entry.fast_type() == expected);
+            assert_eq!(
+                entry.check_type(),
+                expected,
+                "Wrong type for {}. Expected {:?}, got {:?}",
+                entry.name,
+                expected,
+                entry.check_type()
+            );
+        }
+        assert_eq!(seen, names.len());
+    }
 }

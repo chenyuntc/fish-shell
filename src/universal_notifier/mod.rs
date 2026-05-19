@@ -1,5 +1,4 @@
-use once_cell::sync::OnceCell;
-use std::os::fd::RawFd;
+use std::{os::fd::RawFd, sync::LazyLock};
 
 #[cfg(apple)]
 mod notifyd;
@@ -10,7 +9,7 @@ mod inotify;
 #[cfg(bsd)]
 mod kqueue;
 
-#[cfg(test)]
+#[cfg(all(test, any(apple, any(target_os = "android", target_os = "linux"), bsd)))]
 mod test_helpers;
 
 /// The "universal notifier" is an object responsible for broadcasting and receiving universal
@@ -68,9 +67,8 @@ pub fn create_notifier() -> Box<dyn UniversalNotifier> {
     Box::new(NullNotifier)
 }
 
-// Default instance. Other instances are possible for testing.
-static DEFAULT_NOTIFIER: OnceCell<Box<dyn UniversalNotifier>> = OnceCell::new();
-
 pub fn default_notifier() -> &'static dyn UniversalNotifier {
-    DEFAULT_NOTIFIER.get_or_init(create_notifier).as_ref()
+    // Default instance. Other instances are possible for testing.
+    static DEFAULT_NOTIFIER: LazyLock<Box<dyn UniversalNotifier>> = LazyLock::new(create_notifier);
+    &**DEFAULT_NOTIFIER
 }

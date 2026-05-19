@@ -1,3 +1,4 @@
+# localization: skip(private)
 function __fish_complete_man
     # Try to guess what section to search in. If we don't know, we
     # use [^)]*, which should match any section.
@@ -54,7 +55,7 @@ function __fish_complete_man
                   split($1, t, " ");
                   sect = substr(t[3], 2, length(t[3]) - 2);
                   print t[1], sect ": " $2;
-                }   
+                }
                 # Solaris 11
                 # Does not display descriptions
                 # Solaris apropos outputs embedded backspace in descriptions
@@ -69,8 +70,7 @@ function __fish_complete_man
 
         # Fish commands are not given by apropos
         if not set -ql exclude_fish_commands
-            set -l files $__fish_data_dir/man/man1/*.1*
-            string replace -r '.*/([^/]+)\.1(\.gz)?$' '$1\t1: fish command' -- $files (status list-files man/man1/ 2>/dev/null)
+            string join \n -- (__fish_man1_pages)\t'1: fish command'
         end
     else
         return 1

@@ -1,6 +1,6 @@
 use super::errors::Error;
 use super::hex_float;
-use crate::wchar::IntoCharIter;
+use fish_widestring::IntoCharIter;
 
 // Parse a decimal float from a sequence of characters.
 // Return the parsed float, and (on success) the number of characters consumed.
@@ -16,12 +16,8 @@ where
     if let Some(sign) = chars.next_if(|c| ['-', '+'].contains(c)) {
         s.push(sign);
     }
-    if chars
-        .peek()
-        .map(|c| c.is_ascii_alphabetic())
-        .unwrap_or(false)
-    {
-        return parse_inf_nan(chars, s.as_bytes().get(0).copied(), consumed);
+    if chars.peek().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return parse_inf_nan(chars, s.as_bytes().first().copied(), consumed);
     }
 
     while let Some(c) = chars.next_if(|c| c.is_ascii_digit()) {
@@ -98,7 +94,7 @@ pub fn parse_inf_nan(
         }
         return Some(f64::NEG_INFINITY);
     }
-    return None;
+    None
 }
 
 fn wcstod_inner<I>(mut chars: I, decimal_sep: char, consumed: &mut usize) -> Result<f64, Error>
@@ -188,11 +184,11 @@ pub fn is_hex_float<Chars: Iterator<Item = char>>(mut chars: Chars) -> bool {
         }
         Some('0') => (),
         _ => return false,
-    };
+    }
     match chars.next() {
         Some('x') | Some('X') => (),
         _ => return false,
-    };
+    }
     match chars.next() {
         Some(c) => c.is_ascii_hexdigit(),
         None => false,
@@ -279,8 +275,8 @@ where
 }
 
 #[cfg(test)]
-mod test {
-    use super::{wcstod, Error};
+mod tests {
+    use super::{Error, wcstod};
 
     #[test]
     #[allow(clippy::all)]
@@ -583,7 +579,10 @@ mod test {
         test("00000030000e-328", Ok(40000e-328));
         test("30000e-328", Ok(40000e-328));
         test("3e-324", Ok(4e-324));
-        test("5445618932859895362967233318697132813618813095743952975439298223406969961560047552942717636670910728746893019786283454139917900193169748259349067524939840552682198095012176093045431437495773903922425632551857520884625114624126588173520906670968542074438852601438992904761759703022688483745081090292688986958251711580854575674815074162979705098246243690189880319928315307816832576838178256307401454285988871020923752587330172447966674453785790265533466496640456213871241930958703059911787722565044368663670643970181259143319016472430928902201239474588139233890135329130660705762320235358869874608541509790266400643191187286648422874774910682648288516244021893172769161449825765517353755844373640588822904791244190695299838293263075467057383813882521706545084301049855505888186560731e-1035", Ok(5.445618932859895e-255));
+        test(
+            "5445618932859895362967233318697132813618813095743952975439298223406969961560047552942717636670910728746893019786283454139917900193169748259349067524939840552682198095012176093045431437495773903922425632551857520884625114624126588173520906670968542074438852601438992904761759703022688483745081090292688986958251711580854575674815074162979705098246243690189880319928315307816832576838178256307401454285988871020923752587330172447966674453785790265533466496640456213871241930958703059911787722565044368663670643970181259143319016472430928902201239474588139233890135329130660705762320235358869874608541509790266400643191187286648422874774910682648288516244021893172769161449825765517353755844373640588822904791244190695299838293263075467057383813882521706545084301049855505888186560731e-1035",
+            Ok(5.445618932859895e-255),
+        );
         test(
             "5708990770823838890407843763683279797179383808e0",
             Ok(5708990770823838890407843763683279797179383808.0),
@@ -649,7 +648,7 @@ mod test {
     }
 
     fn test(input: &str, val: Result<f64, Error>) {
-        test_sep(input, val, '.')
+        test_sep(input, val, '.');
     }
 
     fn test_sep(input: &str, val: Result<f64, Error>, decimalsep: char) {
@@ -664,12 +663,9 @@ mod test {
             // opportunities for rounding loss in the future.
             assert!(result == val || (result.unwrap() - val.unwrap()).abs() < f64::EPSILON);
         }
-        if result.is_ok() {
+        if let Ok(f) = result {
             assert_eq!(consumed, input.chars().count());
-            assert_eq!(
-                result.unwrap().is_sign_positive(),
-                val.unwrap().is_sign_positive()
-            );
+            assert_eq!(f.is_sign_positive(), val.unwrap().is_sign_positive());
         }
     }
 

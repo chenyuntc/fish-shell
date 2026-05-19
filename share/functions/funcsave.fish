@@ -1,3 +1,4 @@
+# localization: tier1
 function funcsave --description "Save the current definition of all specified functions to file"
     set -l options q/quiet h/help d/directory=
     argparse -n funcsave $options -- $argv
@@ -16,7 +17,7 @@ function funcsave --description "Save the current definition of all specified fu
     end
 
     if not set -q argv[1]
-        printf (_ "%ls: Expected at least %d args, got only %d\n") funcsave 1 0 >&2
+        printf (_ "%s: Expected at least %d args, got only %d\n") funcsave 1 0 >&2
         return 1
     end
 
@@ -32,7 +33,7 @@ function funcsave --description "Save the current definition of all specified fu
             functions --no-details -- $funcname >$funcpath
             and set -q _flag_quiet || printf (_ "%s: wrote %s\n") funcsave $funcpath
         else if test -w $funcpath
-            rm $funcpath
+            command rm $funcpath
             and set -q _flag_quiet || printf (_ "%s: removed %s\n") funcsave $funcpath
         else
             printf (_ "%s: Unknown function '%s'\n") funcsave $funcname >&2

@@ -1,10 +1,10 @@
 #RUN: fish=%fish %fish %s
-#REQUIRES: msgfmt --help
+#REQUIRES: command -v msgfmt
 
 set -l dir (status dirname)
 
 set -l fail_count 0
-for file in $dir/../../po/*.po
+for file in $dir/../../localization/po/*.po
     # We only check the format strings.
     # Later on we might do a full "--check" to also check the headers.
     msgfmt --check-format $file

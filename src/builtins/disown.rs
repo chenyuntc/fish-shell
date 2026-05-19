@@ -1,15 +1,14 @@
 // Implementation of the disown builtin.
 
 use super::prelude::*;
+use crate::builtins::error::Error;
+use crate::builtins::shared::HelpOnlyCmdOpts;
 use crate::io::IoStreams;
 use crate::parser::Parser;
-use crate::proc::{add_disowned_job, Job, Pid};
-use crate::{
-    builtins::shared::HelpOnlyCmdOpts,
-    wchar::wstr,
-    wutil::{fish_wcstoi, wgettext_fmt},
-};
-use libc::SIGCONT;
+use crate::proc::{Job, add_disowned_job};
+use crate::{err_fmt, err_str};
+use fish_widestring::wstr;
+use nix::sys::signal::{Signal, killpg};
 
 /// Helper for builtin_disown.
 fn disown_job(cmd: &wstr, streams: &mut IoStreams, j: &Job) {
@@ -19,30 +18,29 @@ fn disown_job(cmd: &wstr, streams: &mut IoStreams, j: &Job) {
     }
 
     // Stopped disowned jobs must be manually signaled; explain how to do so.
-    let pgid = j.get_pgid();
+    let pgid = j.pgid();
     if j.is_stopped() {
         if let Some(pgid) = pgid {
-            unsafe {
-                libc::killpg(pgid.as_pid_t(), SIGCONT);
-            }
+            let _ = killpg(pgid.as_nix_pid(), Some(Signal::SIGCONT));
         }
-        streams.err.append(wgettext_fmt!(
-            "%ls: job %d ('%ls') was stopped and has been signalled to continue.\n",
-            cmd,
+        err_fmt!(
+            "job %d ('%s') was stopped and has been signalled to continue.",
             j.job_id(),
             j.command()
-        ));
+        )
+        .cmd(cmd)
+        .finish(streams);
     }
 
     // We cannot directly remove the job from the jobs() list as `disown` might be called
     // within the context of a subjob which will cause the parent job to crash in exec_job().
     // Instead, we set a flag and the parser removes the job from the jobs list later.
-    j.mut_flags().disown_requested = true;
+    j.flags_mut().disown_requested = true;
     add_disowned_job(j);
 }
 
 /// Builtin for removing jobs from the job list.
-pub fn disown(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+pub fn disown(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
     let opts = HelpOnlyCmdOpts::parse(args, parser, streams)?;
 
     let cmd = args[0];
@@ -69,9 +67,7 @@ pub fn disown(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
             disown_job(cmd, streams, &job);
             retval = Ok(SUCCESS);
         } else {
-            streams
-                .err
-                .append(wgettext_fmt!("%ls: There are no suitable jobs\n", cmd));
+            err_str!(Error::NO_SUITABLE_JOBS).cmd(cmd).finish(streams);
             retval = Err(STATUS_CMD_ERROR);
         }
     } else {
@@ -80,31 +76,23 @@ pub fn disown(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> B
         // If one argument is not a valid pid (i.e. integer >= 0), fail without disowning anything,
         // but still print errors for all of them.
         // Non-existent jobs aren't an error, but information about them is useful.
-        let mut jobs: Vec<_> = args[1..]
+        let mut jobs: Vec<_> = args[opts.optind..]
             .iter()
             .filter_map(|arg| {
-                // Attempt to convert the argument to a PID.
-                match fish_wcstoi(arg).ok().and_then(Pid::new) {
-                    None => {
-                        // Invalid identifier
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: '%ls' is not a valid job specifier\n",
-                            cmd,
-                            arg
-                        ));
-                        retval = Err(STATUS_INVALID_ARGS);
-                        None
+                let pid = match parse_pid(streams, cmd, arg) {
+                    Ok(pid) => pid,
+                    Err(code) => {
+                        retval = Err(code);
+                        return None;
                     }
-                    Some(pid) => parser.job_get_from_pid(pid).or_else(|| {
-                        // Valid identifier but no such job
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: Could not find job '%d'\n",
-                            cmd,
-                            pid
-                        ));
-                        None
-                    }),
-                }
+                };
+                parser.job_get_from_pid(pid).or_else(|| {
+                    // Valid identifier but no such job
+                    err_fmt!(Error::COULD_NOT_FIND_JOB, pid)
+                        .cmd(cmd)
+                        .finish(streams);
+                    None
+                })
             })
             .collect();
 

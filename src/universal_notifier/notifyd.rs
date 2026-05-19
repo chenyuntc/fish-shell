@@ -1,23 +1,23 @@
 use crate::common::PROGRAM_NAME;
 use crate::fds::{make_fd_nonblocking, set_cloexec};
-use crate::flog::{FLOG, FLOGF};
+use crate::flog::{flog, flogf};
+use crate::prelude::*;
 use crate::universal_notifier::UniversalNotifier;
-use crate::wchar::prelude::*;
 use libc::{c_char, c_int};
 use std::ffi::CString;
 use std::os::fd::{BorrowedFd, RawFd};
 
-extern "C" {
-    fn notify_register_file_descriptor(
+unsafe extern "C" {
+    unsafe fn notify_register_file_descriptor(
         name: *const c_char,
         fd: *mut c_int,
         flags: c_int,
         token: *mut c_int,
     ) -> u32;
 
-    fn notify_post(name: *const c_char) -> u32;
+    unsafe fn notify_post(name: *const c_char) -> u32;
 
-    fn notify_cancel(token: c_int) -> c_int;
+    unsafe fn notify_cancel(token: c_int) -> c_int;
 }
 
 const NOTIFY_STATUS_OK: u32 = 0;
@@ -50,12 +50,12 @@ impl NotifydNotifier {
             notify_register_file_descriptor(name.as_ptr(), &mut notify_fd, 0, &mut token)
         };
         if status != NOTIFY_STATUS_OK || notify_fd < 0 {
-            FLOGF!(
+            flogf!(
                 warning,
                 "notify_register_file_descriptor() failed with status %u.",
                 status
             );
-            FLOG!(
+            flog!(
                 warning,
                 "Universal variable notifications may not be received."
             );
@@ -92,10 +92,10 @@ impl Drop for NotifydNotifier {
 
 impl UniversalNotifier for NotifydNotifier {
     fn post_notification(&self) {
-        FLOG!(uvar_notifier, "posting notification");
+        flog!(uvar_notifier, "posting notification");
         let status = unsafe { notify_post(self.name.as_ptr()) };
         if status != NOTIFY_STATUS_OK {
-            FLOGF!(
+            flogf!(
                 warning,
                 "notify_post() failed with status %u. Uvar notifications may not be sent.",
                 status,
@@ -110,7 +110,7 @@ impl UniversalNotifier for NotifydNotifier {
     fn notification_fd_became_readable(&self, fd: RawFd) -> bool {
         // notifyd notifications come in as 32 bit values. We don't care about the value. We set
         // ourselves as non-blocking, so just read until we can't read any more.
-        assert!(fd == self.notify_fd);
+        assert_eq!(fd, self.notify_fd);
         let mut read_something = false;
         let mut buff: [u8; 64] = [0; 64];
         loop {
@@ -127,7 +127,7 @@ impl UniversalNotifier for NotifydNotifier {
                 _ => continue,
             }
         }
-        FLOGF!(
+        flogf!(
             uvar_notifier,
             "notify fd %s readable",
             if read_something { "was" } else { "was not" },
@@ -136,15 +136,21 @@ impl UniversalNotifier for NotifydNotifier {
     }
 }
 
-#[test]
-fn test_notifyd_notifiers() {
-    let mut notifiers = Vec::new();
-    for _ in 0..16 {
-        notifiers.push(NotifydNotifier::new().expect("failed to create notifier"));
+#[cfg(test)]
+mod tests {
+    use super::NotifydNotifier;
+    use crate::universal_notifier::{UniversalNotifier, test_helpers::test_notifiers};
+
+    #[test]
+    fn test_notifyd_notifiers() {
+        let mut notifiers = Vec::new();
+        for _ in 0..16 {
+            notifiers.push(NotifydNotifier::new().expect("failed to create notifier"));
+        }
+        let notifiers = notifiers
+            .iter()
+            .map(|n| n as &dyn UniversalNotifier)
+            .collect::<Vec<_>>();
+        test_notifiers(&notifiers, None);
     }
-    let notifiers = notifiers
-        .iter()
-        .map(|n| n as &dyn UniversalNotifier)
-        .collect::<Vec<_>>();
-    super::test_helpers::test_notifiers(&notifiers, None);
 }

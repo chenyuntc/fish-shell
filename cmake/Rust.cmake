@@ -1,15 +1,15 @@
+include(FeatureSummary)
 include(FindRust)
 find_package(Rust REQUIRED)
 
-set(FISH_RUST_BUILD_DIR "${CMAKE_BINARY_DIR}/cargo/build")
+set(FISH_RUST_BUILD_DIR "${CMAKE_BINARY_DIR}/cargo")
 
 if(DEFINED ASAN)
     list(APPEND CARGO_FLAGS "-Z" "build-std")
-    list(APPEND FISH_CRATE_FEATURES "asan")
 endif()
 if(DEFINED TSAN)
     list(APPEND CARGO_FLAGS "-Z" "build-std")
-    list(APPEND FISH_CRATE_FEATURES "tsan")
+    list(APPEND FISH_CARGO_FEATURES_LIST "tsan")
 endif()
 
 if (Rust_CARGO_TARGET)
@@ -19,36 +19,18 @@ else()
 endif()
 
 set(rust_profile $<IF:$<CONFIG:Debug>,debug,$<IF:$<CONFIG:RelWithDebInfo>,release-with-debug,release>>)
-set(rust_debugflags "$<$<CONFIG:Debug>:-g>$<$<CONFIG:RelWithDebInfo>:-g>")
 
-
-# Temporary hack to propagate CMake flags/options to build.rs. We need to get CMake to evaluate the
-# truthiness of the strings if they are set.
-set(CMAKE_WITH_GETTEXT "1")
-if(DEFINED WITH_GETTEXT AND NOT "${WITH_GETTEXT}")
-    set(CMAKE_WITH_GETTEXT "0")
+if (NOT DEFINED WITH_MESSAGE_LOCALIZATION) # Don't check for legacy options if the new one is defined, to help bisecting.
+    if(DEFINED WITH_GETTEXT)
+        message(FATAL_ERROR "the WITH_GETTEXT option is no longer supported, use -DWITH_MESSAGE_LOCALIZATION=ON|OFF")
+    endif()
+endif()
+option(WITH_MESSAGE_LOCALIZATION "Build with localization support. Requires `msgfmt` to work." ON)
+# Enable gettext feature unless explicitly disabled.
+if(NOT DEFINED WITH_MESSAGE_LOCALIZATION OR "${WITH_MESSAGE_LOCALIZATION}")
+    list(APPEND FISH_CARGO_FEATURES_LIST "localize-messages")
 endif()
 
-if(FISH_CRATE_FEATURES)
-    set(FEATURES_ARG ${FISH_CRATE_FEATURES})
-    list(PREPEND FEATURES_ARG "--features")
-endif()
+add_feature_info(Translation WITH_MESSAGE_LOCALIZATION "message localization (requires gettext)")
 
-# Tell Cargo where our build directory is so it can find Cargo.toml.
-set(VARS_FOR_CARGO
-    "FISH_BUILD_DIR=${CMAKE_BINARY_DIR}"
-    "PREFIX=${CMAKE_INSTALL_PREFIX}"
-    # Temporary hack to propagate CMake flags/options to build.rs.
-    "CMAKE_WITH_GETTEXT=${CMAKE_WITH_GETTEXT}"
-    # Cheesy so we can tell cmake was used to build
-    "CMAKE=1"
-    "DOCDIR=${CMAKE_INSTALL_FULL_DOCDIR}"
-    "DATADIR=${CMAKE_INSTALL_FULL_DATADIR}"
-    "SYSCONFDIR=${CMAKE_INSTALL_FULL_SYSCONFDIR}"
-    "BINDIR=${CMAKE_INSTALL_FULL_BINDIR}"
-    "LOCALEDIR=${CMAKE_INSTALL_FULL_LOCALEDIR}"
-    "CARGO_TARGET_DIR=${FISH_RUST_BUILD_DIR}"
-    "CARGO_BUILD_RUSTC=${Rust_COMPILER}"
-    "${FISH_PCRE2_BUILDFLAG}"
-    "RUSTFLAGS=$ENV{RUSTFLAGS} ${rust_debugflags}"
-)
+list(JOIN FISH_CARGO_FEATURES_LIST , FISH_CARGO_FEATURES)

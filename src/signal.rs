@@ -1,18 +1,26 @@
-use std::mem::MaybeUninit;
-use std::num::NonZeroI32;
-
-use crate::common::exit_without_destructors;
 use crate::event::{enqueue_signal, is_signal_observed};
-use crate::nix::getpid;
-use crate::reader::{reader_handle_sigint, reader_sighup, safe_restore_term_mode};
-use crate::termsize::TermsizeContainer;
-use crate::topic_monitor::{topic_monitor_principal, Generation, GenerationsList, Topic};
-use crate::tty_handoff::{safe_deactivate_tty_protocols, safe_mark_tty_invalid};
-use crate::wchar::prelude::*;
-use crate::wutil::{fish_wcstoi, perror};
+use crate::prelude::*;
+use crate::reader::{signal_safe_reader_handle_sigint, signal_safe_reader_set_exit_signal};
+use crate::termsize::signal_safe_termsize_invalidate_tty;
+use crate::topic_monitor::{Generation, GenerationsList, Topic, topic_monitor_principal};
+use crate::tty_handoff::signal_safe_mark_tty_invalid;
+use crate::wutil::fish_wcstoi;
 use errno::{errno, set_errno};
-use once_cell::sync::Lazy;
-use std::sync::atomic::{AtomicI32, Ordering};
+use fish_common::exit_without_destructors;
+use fish_util::perror;
+use nix::sys::signal::kill;
+use nix::{
+    sys::signal::{SaFlags, SigAction, SigHandler, SigSet, SigmaskHow, sigprocmask},
+    unistd::getpid,
+};
+use std::{
+    mem::MaybeUninit,
+    num::NonZeroI32,
+    sync::{
+        LazyLock,
+        atomic::{AtomicI32, Ordering},
+    },
+};
 
 /// Store the "main" pid. This allows us to reliably determine if we are in a forked child.
 static MAIN_PID: AtomicI32 = AtomicI32::new(0);
@@ -23,7 +31,7 @@ static MAIN_PID: AtomicI32 = AtomicI32::new(0);
 /// and re-raise the signal. Return whether we re-raised the signal.
 fn reraise_if_forked_child(sig: i32) -> bool {
     // Don't use is_forked_child: it relies on atfork handlers which may have not yet run.
-    if getpid() == MAIN_PID.load(Ordering::Relaxed) {
+    if getpid().as_raw() == MAIN_PID.load(Ordering::Relaxed) {
         return false;
     }
 
@@ -78,39 +86,29 @@ extern "C" fn fish_signal_handler(
     match sig {
         libc::SIGWINCH => {
             // Respond to a winch signal by telling the termsize container.
-            TermsizeContainer::handle_winch();
+            signal_safe_termsize_invalidate_tty();
         }
-        libc::SIGHUP => {
+        libc::SIGHUP | libc::SIGTERM => {
             // Exit unless the signal was trapped.
             if !observed {
-                reader_sighup();
-                safe_mark_tty_invalid();
-            }
-            topic_monitor_principal().post(Topic::sighupint);
-        }
-        libc::SIGTERM => {
-            // Handle sigterm. The only thing we do is restore the front process ID and disable protocols, then die.
-            if !observed {
-                safe_restore_term_mode();
-                safe_deactivate_tty_protocols();
-                // Safety: signal() and raise() are async-signal-safe.
-                unsafe {
-                    libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                    libc::raise(libc::SIGTERM);
+                signal_safe_reader_set_exit_signal(sig);
+                if sig == libc::SIGHUP {
+                    signal_safe_mark_tty_invalid();
                 }
             }
+            topic_monitor_principal().post(Topic::SigHupIntTerm);
         }
         libc::SIGINT => {
             // Cancel unless the signal was trapped.
             if !observed {
                 CANCELLATION_SIGNAL.store(libc::SIGINT, Ordering::Relaxed);
             }
-            reader_handle_sigint();
-            topic_monitor_principal().post(Topic::sighupint);
+            signal_safe_reader_handle_sigint();
+            topic_monitor_principal().post(Topic::SigHupIntTerm);
         }
         libc::SIGCHLD => {
             // A child process stopped or exited.
-            topic_monitor_principal().post(Topic::sigchld);
+            topic_monitor_principal().post(Topic::SigChld);
         }
         libc::SIGALRM => {
             // We have a sigalarm handler that does nothing. This is used in the signal torture
@@ -125,10 +123,7 @@ extern "C" fn fish_signal_handler(
 /// Set all signal handlers to SIG_DFL.
 /// This is called after fork - it should be async signal safe.
 pub fn signal_reset_handlers() {
-    let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
-    unsafe { libc::sigemptyset(&mut act.sa_mask) };
-    act.sa_flags = 0;
-    act.sa_sigaction = libc::SIG_DFL;
+    let act = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty()).into();
 
     for data in SIGNAL_TABLE.iter() {
         if data.signal == libc::SIGHUP {
@@ -152,7 +147,7 @@ fn sigaction(sig: i32, act: &libc::sigaction, oact: *mut libc::sigaction) -> lib
 }
 
 fn set_interactive_handlers() {
-    let signal_handler: usize = fish_signal_handler as usize;
+    let signal_handler: usize = fish_signal_handler as *const () as libc::sighandler_t;
     let mut act: libc::sigaction = unsafe { std::mem::zeroed() };
     let mut oact: libc::sigaction = unsafe { std::mem::zeroed() };
     act.sa_flags = 0;
@@ -172,7 +167,7 @@ fn set_interactive_handlers() {
     act.sa_flags = libc::SA_SIGINFO;
     sigaction(libc::SIGTTIN, &act, nullptr);
 
-    // SIGTERM restores the terminal controlling process before dying.
+    // SIGTERM defers to allow graceful history save before exit.
     act.sa_sigaction = signal_handler;
     act.sa_flags = libc::SA_SIGINFO;
     sigaction(libc::SIGTERM, &act, nullptr);
@@ -197,7 +192,7 @@ fn set_interactive_handlers() {
 /// Set signal handlers to fish default handlers.
 pub fn signal_set_handlers(interactive: bool) {
     // Mark our main pid.
-    MAIN_PID.store(getpid(), Ordering::Relaxed);
+    MAIN_PID.store(getpid().as_raw(), Ordering::Relaxed);
 
     use libc::SIG_IGN;
     let nullptr = std::ptr::null_mut();
@@ -216,12 +211,12 @@ pub fn signal_set_handlers(interactive: bool) {
     sigaction(libc::SIGQUIT, &act, nullptr);
 
     // Apply our SIGINT handler.
-    act.sa_sigaction = fish_signal_handler as usize;
+    act.sa_sigaction = fish_signal_handler as *const () as libc::sighandler_t;
     act.sa_flags = libc::SA_SIGINFO;
     sigaction(libc::SIGINT, &act, nullptr);
 
     // Whether or not we're interactive we want SIGCHLD to not interrupt restartable syscalls.
-    act.sa_sigaction = fish_signal_handler as usize;
+    act.sa_sigaction = fish_signal_handler as *const () as libc::sighandler_t;
     act.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
     if sigaction(libc::SIGCHLD, &act, nullptr) != 0 {
         perror("sigaction");
@@ -241,7 +236,7 @@ pub fn signal_set_handlers(interactive: bool) {
         // The workaround is to send ourselves a SIGCHLD signal now, to force the allocation to happen.
         // As no child is associated with this signal, it is OK if it is dropped, so long as the
         // allocation happens.
-        unsafe { libc::kill(getpid(), libc::SIGCHLD) };
+        let _ = kill(getpid(), nix::sys::signal::Signal::SIGCHLD);
     }
 }
 
@@ -274,11 +269,11 @@ pub fn signal_handle(sig: Signal) {
     act.sa_flags = 0;
     unsafe { libc::sigemptyset(&mut act.sa_mask) };
     act.sa_flags = libc::SA_SIGINFO;
-    act.sa_sigaction = fish_signal_handler as usize;
+    act.sa_sigaction = fish_signal_handler as *const () as libc::sighandler_t;
     sigaction(sig, &act, std::ptr::null_mut());
 }
 
-pub static signals_to_default: Lazy<libc::sigset_t> = Lazy::new(|| {
+pub static SIGNALS_TO_DEFAULT: LazyLock<libc::sigset_t> = LazyLock::new(|| {
     let mut set = MaybeUninit::uninit();
     unsafe { libc::sigemptyset(set.as_mut_ptr()) };
     for data in SIGNAL_TABLE.iter() {
@@ -300,40 +295,36 @@ pub static signals_to_default: Lazy<libc::sigset_t> = Lazy::new(|| {
 
 /// Ensure we did not inherit any blocked signals. See issue #3964.
 pub fn signal_unblock_all() {
-    unsafe {
-        let mut iset = MaybeUninit::uninit();
-        libc::sigemptyset(iset.as_mut_ptr());
-        libc::sigprocmask(libc::SIG_SETMASK, iset.as_ptr(), std::ptr::null_mut());
-    }
+    sigprocmask(SigmaskHow::SIG_SETMASK, Some(&SigSet::empty()), None).unwrap();
 }
 
 /// A Sigchecker can be used to check if a SIGINT (or SIGHUP) has been delivered.
 pub struct SigChecker {
     topic: Topic,
-    gen: Generation,
+    r#gen: Generation,
 }
 
 impl SigChecker {
     /// Create a new checker for the given topic.
     pub fn new(topic: Topic) -> Self {
-        let mut res = SigChecker { topic, gen: 0 };
+        let mut res = SigChecker { topic, r#gen: 0 };
         // Call check() to update our generation.
         res.check();
         res
     }
 
     /// Create a new checker for SIGHUP and SIGINT.
-    pub fn new_sighupint() -> Self {
-        Self::new(Topic::sighupint)
+    pub fn new_sighupintterm() -> Self {
+        Self::new(Topic::SigHupIntTerm)
     }
 
     /// Check if a sigint has been delivered since the last call to check(), or since the detector
     /// was created.
     pub fn check(&mut self) -> bool {
         let tm = topic_monitor_principal();
-        let gen = tm.generation_for_topic(self.topic);
-        let changed = self.gen != gen;
-        self.gen = gen;
+        let r#gen = tm.generation_for_topic(self.topic);
+        let changed = self.r#gen != r#gen;
+        self.r#gen = r#gen;
         changed
     }
 
@@ -341,7 +332,7 @@ impl SigChecker {
     pub fn wait(&self) {
         let tm = topic_monitor_principal();
         let gens = GenerationsList::invalid();
-        gens.set(self.topic, self.gen);
+        gens.set(self.topic, self.r#gen);
         tm.check(&gens, true /* wait */);
     }
 }
@@ -404,7 +395,7 @@ const SIGNAL_TABLE : &[LookupEntry] = &[
     signal_entry!(SIGURG, "Urgent socket condition"),
     signal_entry!(SIGXCPU, "CPU time limit exceeded"),
     signal_entry!(SIGXFSZ, "File size limit exceeded"),
-    signal_entry!(SIGVTALRM, "Virtual timefr expired"),
+    signal_entry!(SIGVTALRM, "Virtual timer expired"),
     signal_entry!(SIGPROF, "Profiling timer expired"),
     signal_entry!(SIGWINCH, "Window size change"),
     signal_entry!(SIGIO, "I/O on asynchronous file descriptor is possible"),
@@ -417,7 +408,17 @@ const SIGNAL_TABLE : &[LookupEntry] = &[
     #[cfg(any(apple, bsd))]
     signal_entry!(SIGINFO, SIGINFO_DESC),
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(
+        target_os = "linux",
+        not(any(
+            target_arch = "mips",
+            target_arch = "mips32r6",
+            target_arch = "mips64",
+            target_arch = "mips64r6",
+            target_arch = "sparc",
+            target_arch = "sparc64",
+        ))
+    ))]
     signal_entry!(SIGSTKFLT, SIGSTKFLT_DESC),
 
     #[cfg(target_os = "linux")]
@@ -464,7 +465,7 @@ fn equals_ascii_icase(left: &wstr, right: &wstr) -> bool {
 fn match_signal_name(canonical: &wstr, mut name: &wstr) -> bool {
     // Skip the "SIG" prefix if it exists.
     if name.char_count() >= 3 && equals_ascii_icase(name.slice_to(3), L!("sig")) {
-        name = name.slice_from(3)
+        name = name.slice_from(3);
     }
     equals_ascii_icase(canonical.slice_from(3), name)
 }
@@ -557,42 +558,46 @@ impl From<Signal> for NonZeroI32 {
     }
 }
 
-// Need to use add_test for wgettext support.
+#[cfg(test)]
+mod tests {
+    use super::Signal;
+    use crate::prelude::*;
 
-#[test]
-fn test_signal_name() {
-    let sig = Signal::new(libc::SIGINT);
-    assert_eq!(sig.name(), "SIGINT");
-}
+    #[test]
+    fn test_signal_name() {
+        let sig = Signal::new(libc::SIGINT);
+        assert_eq!(sig.name(), "SIGINT");
+    }
 
-#[rustfmt::skip]
-#[test]
-fn test_signal_parse() {
-    assert_eq!(Signal::parse(L!("SIGHUP")), Some(Signal::new(libc::SIGHUP)));
-    assert_eq!(Signal::parse(L!("sigwinch")), Some(Signal::new(libc::SIGWINCH)));
-    assert_eq!(Signal::parse(L!("TSTP")), Some(Signal::new(libc::SIGTSTP)));
-    assert_eq!(Signal::parse(L!("TstP")), Some(Signal::new(libc::SIGTSTP)));
-    assert_eq!(Signal::parse(L!("sigCONT")), Some(Signal::new(libc::SIGCONT)));
-    assert_eq!(Signal::parse(L!("SIGFOO")), None);
-    assert_eq!(Signal::parse(L!("")), None);
-    assert_eq!(Signal::parse(L!("SIG")), None);
-    assert_eq!(Signal::parse(L!("سلام")), None);
+    #[rustfmt::skip]
+    #[test]
+    fn test_signal_parse() {
+        assert_eq!(Signal::parse(L!("SIGHUP")), Some(Signal::new(libc::SIGHUP)));
+        assert_eq!(Signal::parse(L!("sigwinch")), Some(Signal::new(libc::SIGWINCH)));
+        assert_eq!(Signal::parse(L!("TSTP")), Some(Signal::new(libc::SIGTSTP)));
+        assert_eq!(Signal::parse(L!("TstP")), Some(Signal::new(libc::SIGTSTP)));
+        assert_eq!(Signal::parse(L!("sigCONT")), Some(Signal::new(libc::SIGCONT)));
+        assert_eq!(Signal::parse(L!("SIGFOO")), None);
+        assert_eq!(Signal::parse(L!("")), None);
+        assert_eq!(Signal::parse(L!("SIG")), None);
+        assert_eq!(Signal::parse(L!("سلام")), None);
 
-    assert_eq!(Signal::parse(&libc::SIGINT.to_wstring()), Some(Signal::new(libc::SIGINT)));
-    assert_eq!(Signal::parse(L!("0")), None);
-    assert_eq!(Signal::parse(L!("-0")), None);
-    assert_eq!(Signal::parse(L!("-1")), None);
-}
+        assert_eq!(Signal::parse(&libc::SIGINT.to_wstring()), Some(Signal::new(libc::SIGINT)));
+        assert_eq!(Signal::parse(L!("0")), None);
+        assert_eq!(Signal::parse(L!("-0")), None);
+        assert_eq!(Signal::parse(L!("-1")), None);
+    }
 
-#[test]
-#[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
-/// Verify bsd feature is detected on the known BSDs, which gives us greater confidence it'll work
-/// for the unknown ones too. We don't need to do this for Linux and macOS because we're using
-/// rust's native OS targeting for those.
-fn bsd_signals() {
-    assert_eq!(Signal::parse(L!("SIGEMT")), Some(Signal::new(libc::SIGEMT)));
-    assert_eq!(
-        Signal::parse(L!("SIGINFO")),
-        Some(Signal::new(libc::SIGINFO))
-    );
+    #[test]
+    #[cfg(any(target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))]
+    /// Verify bsd feature is detected on the known BSDs, which gives us greater confidence it'll work
+    /// for the unknown ones too. We don't need to do this for Linux and macOS because we're using
+    /// rust's native OS targeting for those.
+    fn bsd_signals() {
+        assert_eq!(Signal::parse(L!("SIGEMT")), Some(Signal::new(libc::SIGEMT)));
+        assert_eq!(
+            Signal::parse(L!("SIGINFO")),
+            Some(Signal::new(libc::SIGINFO))
+        );
+    }
 }

@@ -1,5 +1,3 @@
-.. _cmd-cd:
-
 cd - change directory
 =====================
 
@@ -43,7 +41,7 @@ Examples
 
     cd
     # changes the working directory to your home directory.
-    
+
     cd /usr/src/fish-shell
     # changes the working directory to /usr/src/fish-shell
 

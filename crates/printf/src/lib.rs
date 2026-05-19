@@ -4,9 +4,8 @@ pub use arg::{Arg, ToArg};
 
 mod fmt_fp;
 mod printf_impl;
-pub use printf_impl::{sprintf_locale, Error, FormatString};
+pub use printf_impl::{Error, FormatString, sprintf_locale};
 pub mod locale;
-pub use locale::{Locale, C_LOCALE, EN_US_LOCALE};
 
 #[cfg(test)]
 mod tests;
@@ -52,7 +51,7 @@ macro_rules! sprintf {
         {
             // May be no args!
             #[allow(unused_imports)]
-            use $crate::ToArg;
+            use $crate::ToArg as _;
             $crate::printf_c_locale(
                 $target,
                 $fmt,
@@ -85,7 +84,7 @@ macro_rules! sprintf {
 ///
 /// let result = printf_c_locale(&mut output, fmt, &mut args);
 ///
-/// assert!(result == Ok(10));
+/// assert_eq!(result, Ok(10));
 /// assert_eq!(output, "1.2346e+05");
 /// ```
 pub fn printf_c_locale(

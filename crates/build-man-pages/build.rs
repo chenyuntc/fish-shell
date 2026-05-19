@@ -1,50 +1,50 @@
-#[cfg(not(clippy))]
 use std::path::Path;
 
-fn main() {
-    let cargo_target_dir = fish_build_helper::get_target_dir();
-    let mandir = cargo_target_dir.join("fish-man");
-    let sec1dir = mandir.join("man1");
-    // Running `cargo clippy` on a clean build directory panics, because when rust-embed tries to
-    // embed a directory which does not exist it will panic.
-    let _ = std::fs::create_dir_all(sec1dir.to_str().unwrap());
+use fish_build_helper::{as_os_strs, fish_doc_dir};
 
-    #[cfg(not(clippy))]
-    build_man(&mandir);
+fn main() {
+    let sec1_dir = fish_doc_dir().join("man").join("man1");
+    // Running `cargo clippy` on a clean build directory panics, because when rust-embed
+    // tries to embed a directory which does not exist it will panic.
+    let _ = std::fs::create_dir_all(&sec1_dir);
+    if !cfg!(clippy) {
+        build_man(&sec1_dir);
+    }
 }
 
-#[cfg(not(clippy))]
-fn build_man(man_dir: &Path) {
-    use std::{env, process::Command};
+fn build_man(sec1_dir: &Path) {
+    use fish_build_helper::{env_var, workspace_root};
+    use std::process::{Command, Stdio};
 
-    let repo_root_dir = fish_build_helper::get_repo_root();
+    let workspace_root = workspace_root();
+    let doc_src_dir = workspace_root.join("doc_src");
+    let doctrees_dir = fish_doc_dir().join(".doctrees-man");
 
-    let man_str = man_dir.to_str().unwrap();
+    fish_build_helper::rebuild_if_paths_changed([
+        &workspace_root.join("CHANGELOG.rst"),
+        &workspace_root.join("CONTRIBUTING.rst"),
+        &doc_src_dir,
+    ]);
 
-    let sec1_dir = man_dir.join("man1");
-    let sec1_str = sec1_dir.to_str().unwrap();
-
-    let docsrc_dir = repo_root_dir.join("doc_src");
-    let docsrc_str = docsrc_dir.to_str().unwrap();
-
-    let sphinx_doc_sources = [
-        repo_root_dir.join("CHANGELOG.rst"),
-        repo_root_dir.join("CONTRIBUTING.rst"),
-        docsrc_dir.clone(),
-    ];
-    fish_build_helper::rebuild_if_paths_changed(sphinx_doc_sources);
-
-    let args = &[
-        "-j", "auto", "-q", "-b", "man", "-c", docsrc_str,
+    let args = as_os_strs![
+        "-j",
+        "auto",
+        "-q",
+        "-b",
+        "man",
+        "-c",
+        &doc_src_dir,
         // doctree path - put this *above* the man1 dir to exclude it.
         // this is ~6M
-        "-d", man_str, docsrc_str, sec1_str,
+        "-d",
+        &doctrees_dir,
+        &doc_src_dir,
+        &sec1_dir,
     ];
-    let _ = std::fs::create_dir_all(sec1_str);
 
     rsconf::rebuild_if_env_changed("FISH_BUILD_DOCS");
-    if env::var("FISH_BUILD_DOCS") == Ok("0".to_string()) {
-        println!("cargo:warning=Skipping man pages because $FISH_BUILD_DOCS is set to 0");
+    if env_var("FISH_BUILD_DOCS") == Some("0".to_owned()) {
+        rsconf::warn!("Skipping man pages because $FISH_BUILD_DOCS is set to 0");
         return;
     }
 
@@ -53,30 +53,49 @@ fn build_man(man_dir: &Path) {
     // - if we skipped the docs with sphinx not installed, installing it would not then build the docs.
     // That means you need to explicitly set $FISH_BUILD_DOCS=0 (`FISH_BUILD_DOCS=0 cargo install --path .`),
     // which is unfortunate - but the docs are pretty important because they're also used for --help.
-    match Command::new("sphinx-build").args(args).spawn() {
-        Err(x) if x.kind() == std::io::ErrorKind::NotFound => {
-            if env::var("FISH_BUILD_DOCS") == Ok("1".to_string()) {
-                panic!("Could not find sphinx-build to build man pages.\nInstall sphinx or disable building the docs by setting $FISH_BUILD_DOCS=0.");
-            }
-            println!("cargo:warning=Cannot find sphinx-build to build man pages.");
-            println!("cargo:warning=If you install it now you need to run `cargo clean` and rebuild, or set $FISH_BUILD_DOCS=1 explicitly.");
+    let sphinx_build = match Command::new(option_env!("FISH_SPHINX").unwrap_or("sphinx-build"))
+        .args(args)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            assert_ne!(
+                env_var("FISH_BUILD_DOCS"),
+                Some("1".to_owned()),
+                "Could not find sphinx-build required to build man pages.\n\
+                 Install Sphinx or disable building the docs by setting $FISH_BUILD_DOCS=0."
+            );
+            rsconf::warn!(
+                "Could not find sphinx-build required to build man pages. \
+                 If you install Sphinx now, you need to trigger a rebuild to include man pages. \
+                 For example by running `touch doc_src` followed by the build command."
+            );
+            return;
         }
-        Err(x) => {
+        Err(e) => {
             // Another error - permissions wrong etc
-            panic!("Error starting sphinx-build to build man pages: {:?}", x);
+            panic!("Error starting sphinx-build to build man pages: {:?}", e);
         }
-        Ok(mut x) => match x.wait() {
-            Err(err) => {
-                panic!(
-                    "Error waiting for sphinx-build to build man pages: {:?}",
-                    err
-                );
+        Ok(sphinx_build) => sphinx_build,
+    };
+
+    match sphinx_build.wait_with_output() {
+        Err(err) => {
+            panic!(
+                "Error waiting for sphinx-build to build man pages: {:?}",
+                err
+            );
+        }
+        Ok(out) => {
+            if !out.stderr.is_empty() {
+                rsconf::warn!("sphinx-build: {}", String::from_utf8_lossy(&out.stderr));
             }
-            Ok(out) => {
-                if !out.success() {
-                    panic!("sphinx-build failed to build the man pages.");
-                }
-            }
-        },
+            assert_eq!(&String::from_utf8_lossy(&out.stdout), "");
+            assert!(
+                out.status.success(),
+                "sphinx-build failed to build the man pages."
+            );
+        }
     }
 }

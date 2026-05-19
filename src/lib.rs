@@ -1,28 +1,9 @@
-#![cfg_attr(feature = "benchmark", feature(test))]
+#![cfg_attr(
+    all(nightly, feature = "benchmark"),
+    feature(test),
+    allow(unused_features)
+)]
 #![allow(non_camel_case_types)]
-#![allow(non_upper_case_globals)]
-#![allow(unknown_lints)]
-#![allow(unstable_name_collisions)]
-#![allow(rustdoc::private_intra_doc_links)]
-#![allow(clippy::bool_assert_comparison)]
-#![allow(clippy::collapsible_if)]
-#![allow(clippy::comparison_chain)]
-#![allow(clippy::derivable_impls)]
-#![allow(clippy::doc_lazy_continuation)]
-#![allow(clippy::doc_overindented_list_items)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::get_first)]
-#![allow(clippy::if_same_then_else)]
-#![allow(clippy::incompatible_msrv)]
-#![allow(clippy::len_without_is_empty)]
-#![allow(clippy::manual_is_ascii_check)]
-#![allow(clippy::manual_range_contains)]
-#![allow(clippy::needless_lifetimes)]
-#![allow(clippy::needless_return)]
-#![allow(clippy::new_without_default)]
-#![allow(clippy::option_map_unit_fn)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::uninlined_format_args)]
 
 pub const BUILD_VERSION: &str = env!("FISH_BUILD_VERSION");
 
@@ -36,7 +17,6 @@ pub mod abbrs;
 pub mod ast;
 pub mod autoload;
 pub mod builtins;
-pub mod color;
 pub mod complete;
 pub mod copilot_autocomplete;
 pub mod editable_line;
@@ -46,7 +26,6 @@ pub mod env_universal_common;
 pub mod event;
 pub mod exec;
 pub mod expand;
-pub mod fallback;
 pub mod fd_monitor;
 pub mod fd_readable_set;
 pub mod fds;
@@ -54,8 +33,6 @@ pub mod flog;
 pub mod fork_exec;
 pub mod fs;
 pub mod function;
-pub mod future;
-pub mod future_feature_flags;
 pub mod global_safety;
 pub mod highlight;
 pub mod history;
@@ -65,9 +42,8 @@ pub mod io;
 pub mod job_group;
 pub mod key;
 pub mod kill;
-#[allow(non_snake_case)]
-pub mod libc;
 pub mod locale;
+pub mod localization;
 pub mod nix;
 pub mod null_terminated_array;
 pub mod operation_context;
@@ -80,14 +56,16 @@ pub mod parse_util;
 pub mod parser;
 pub mod parser_keywords;
 pub mod path;
+pub mod portable_atomic;
+pub mod prelude;
 pub mod print_help;
 pub mod proc;
 pub mod re;
 pub mod reader;
-pub mod reader_history_search;
 pub mod redirection;
 pub mod screen;
 pub mod signal;
+pub mod stdx;
 pub mod terminal;
 pub mod termsize;
 pub mod text_face;
@@ -99,13 +77,7 @@ pub mod topic_monitor;
 pub mod trace;
 pub mod tty_handoff;
 pub mod universal_notifier;
-pub mod util;
 pub mod wait_handle;
-pub mod wchar;
-pub mod wchar_ext;
-pub mod wcstringutil;
-pub mod wgetopt;
-pub mod widecharwidth;
 pub mod wildcard;
 
 #[cfg(feature = "gettext-extract")]

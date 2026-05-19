@@ -1,3 +1,4 @@
+# localization: tier1
 #
 # Wrap the builtin cd command to maintain directory history.
 #
@@ -13,7 +14,7 @@ function cd --description "Change directory"
     end
 
     # Skip history in subshells.
-    if status --is-command-substitution
+    if status is-command-substitution
         builtin cd $argv
         return $status
     end

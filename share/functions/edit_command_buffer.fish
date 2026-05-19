@@ -1,24 +1,15 @@
+# localization: tier1
 function edit_command_buffer --description 'Edit the command buffer in an external editor'
-    set -l f (mktemp)
+    set -l tmpdir (__fish_mktemp_relative -d fish)
     or return 1
-    if set -q f[1]
-        command mv $f $f.fish
-        set f $f.fish
-    else
-        # We should never execute this block but better to be paranoid.
-        if set -q TMPDIR
-            set f $TMPDIR/fish.$fish_pid.fish
-        else
-            set f /tmp/fish.$fish_pid.fish
-        end
-        command touch $f
-        or return 1
-    end
+    set -l f $tmpdir/command-line.fish
+    command touch $f
+    or return 1
 
     set -l editor (__fish_anyeditor)
     or return 1
 
-    set -l indented_lines (commandline -b | __fish_indent --only-indent)
+    set -l indented_lines (commandline -b | fish_indent --only-indent)
     string join -- \n $indented_lines >$f
     set -l offset (commandline --cursor)
     # compute cursor line/column
@@ -52,13 +43,15 @@ function edit_command_buffer --description 'Edit the command buffer in an extern
                     set found true
                     break
                 end
-                set cursor_from_editor (mktemp)
+                set cursor_from_editor (__fish_mktemp_relative fish-edit_command_buffer)
+                or return
                 set -a editor +$line "+norm! $col|" $f \
                     '+au VimLeave * ++once call writefile([printf("%s %s %s", shellescape(bufname()), line("."), col("."))], "'$cursor_from_editor'")'
             case emacs emacsclient gedit
                 set -a editor +$line:$col $f
             case kak
-                set cursor_from_editor (mktemp)
+                set cursor_from_editor (__fish_mktemp_relative fish-edit_command_buffer)
+                or return
                 set -a editor +$line:$col $f -e "
                         hook -always -once global ClientClose %val{client} %{
                             echo -to-file $cursor_from_editor -quoting shell \
@@ -90,7 +83,7 @@ function edit_command_buffer --description 'Edit the command buffer in an extern
     $editor
 
     set -l raw_lines (command cat $f)
-    set -l unindented_lines (string join -- \n $raw_lines | __fish_indent --only-unindent)
+    set -l unindented_lines (string join -- \n $raw_lines | fish_indent --only-unindent)
 
     # Here we're checking the exit status of the editor.
     if test $status -eq 0 -a -s $f
@@ -104,7 +97,7 @@ function edit_command_buffer --description 'Edit the command buffer in an extern
         echo (_ "or the file was empty")
     end
     if set -q cursor_from_editor[1]
-        eval set -l pos "$(cat $cursor_from_editor)"
+        eval set -l pos "$(command cat $cursor_from_editor)"
         if set -q pos[1] && test $pos[1] = $f
             set -l line $pos[2]
             set -l indent (math (string length -- "$raw_lines[$line]") - (string length -- "$unindented_lines[$line]"))
@@ -117,7 +110,7 @@ function edit_command_buffer --description 'Edit the command buffer in an extern
         end
         command rm $cursor_from_editor
     end
-    command rm $f
+    command rm -r (path dirname $f)
     # We've probably opened something that messed with the screen.
     # A repaint seems in order.
     commandline -f repaint

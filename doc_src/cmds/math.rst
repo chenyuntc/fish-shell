@@ -1,5 +1,3 @@
-.. _cmd-math:
-
 math - perform mathematics calculations
 =======================================
 
@@ -30,6 +28,11 @@ When in doubt, use parentheses.
 
 ``math`` ignores whitespace between arguments and takes its input as multiple arguments (internally joined with a space), so ``math 2 +2`` and ``math "2 +    2"`` work the same.
 ``math 2 2`` is an error.
+
+.. note::
+
+   math is a simple tool for simple uses, provided for convenience. It internally works with floats for simplicity of implementation and can't do a number of things real calculators can.
+   If you find yourself limited by that, use a more full-featured tool.
 
 The following options are available:
 
@@ -155,7 +158,7 @@ Functions
 ``ln``
     the base-e logarithm
 ``log`` or ``log10``
-    the base-10 logarithm
+    the base-10 logarithm. To compute the logarithm for an arbitrary base ``b``, use ``log(x) / log(b)``.
 ``log2``
     the base-2 logarithm
 ``max``

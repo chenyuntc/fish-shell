@@ -1,5 +1,3 @@
-.. _cmd-status:
-
 status - query fish runtime information
 =======================================
 
@@ -30,9 +28,12 @@ Synopsis
     status job-control CONTROL_TYPE
     status features
     status test-feature FEATURE
-    status buildinfo
+    status build-info
     status get-file FILE
-    status list-files [PATH]
+    status list-files [PATH ...]
+    status terminal
+    status test-terminal-feature FEATURE
+    status language [list-available|set [LANGUAGE ...]|unset]
 
 Description
 -----------
@@ -99,27 +100,82 @@ The following operations (subcommands) are available:
     Sets the job control type to *CONTROL_TYPE*, which can be **none**, **full**, or **interactive**.
 
 **features**
-    Lists all available feature flags.
+    Lists all available :ref:`feature flags <featureflags>`.
 
 **test-feature** *FEATURE*
     Returns 0 when FEATURE is enabled, 1 if it is disabled, and 2 if it is not recognized.
 
-**buildinfo**
+**build-info**
     This prints information on how fish was build - which architecture, which build system or profile was used, etc.
     This is mainly useful for debugging.
 
+.. _status-get-file:
+
 **get-file** *FILE*
+    NOTE: this subcommand is mainly intended for fish's internal use; let us know if you want to use it elsewhere.
+
     This prints a file embedded in the fish binary at compile time. This includes the default set of functions and completions,
     as well as the man pages and themes. Which files are included depends on build settings.
     Returns 0 if the file was included, 1 otherwise.
 
-**list-files** *FILE*
+**list-files** *FILE...*
+    NOTE: this subcommand is mainly intended for fish's internal use; let us know if you want to use it elsewhere.
+
     This lists the files embedded in the fish binary at compile time. Only files where the path starts with the optional *FILE* argument are shown.
     Returns 0 if something was printed, 1 otherwise.
+
+.. _status-terminal:
+
+**terminal**
+    Prints the name and version of the terminal fish is running inside (for example as reported via :ref:`XTVERSION <term-compat-xtversion>`).
+    This is not available during early startup but only starting from when the first interactive prompt is shown, possibly via builtin :doc:`read <read>`,
+    so before the first ``fish_prompt`` or ``fish_read`` :ref:`event <event>`.
+
+.. _status-terminal-os:
+
+**terminal-os**
+    Prints the name of the operating system (OS) the terminal is running on, as reported via :ref:`XTGETTCAP query-os-name <term-compat-xtgettcap>`.
+    Like :ref:`status terminal <status-terminal>`, this only works once the first interactive prompt is shown.
+    Returns 1 if the OS name is not available.
+
+.. _status-test-terminal-features:
+
+**test-terminal-feature** *FEATURE*
+    Returns 0 when the terminal was :ref:`detected <term-compat-xtgettcap>` to support the given feature.
+    Like :ref:`status terminal <status-terminal>`, this only works once the first interactive prompt is shown.
+
+    Currently the only available *FEATURE* is :ref:`scroll-content-up <term-compat-indn>`.
+    An error will be printed when passed an unrecognized feature.
+
+.. _status-language:
+
+**language**
+    Show or modify message localization settings.
+    When invoked without arguments, the current language settings are shown.
+
+    Available subcommands:
+
+    **list-available**
+    prints the language names for which fish has translations.
+    These names can be used with the **set** subcommand.
+
+    **set**
+    sets the language precedence for fish's messages.
+    Overrides language settings configured via :ref:`environment variables <variables-locale>`, but only applies to fish itself, not to any child processes.
+    Takes a list of language names from the set shown by the **list-available** subcommand.
+    For some languages, fish's translation catalogs are incomplete, meaning not all messages can be shown in these languages.
+    Therefore, we allow specifying a list here, with translations taken from the first specified language which has a translation available for a message.
+    For example, after running ``status language set pt_BR fr``, all messages which have a translation into Brazilian Portuguese will be shown in that language.
+    The remaining messages will be shown in French, if a French translation is available.
+    If none of the specified languages have a translation available for a message, the message will be shown in English.
+
+    **unset**
+    undoes the effects of the **set** subcommand.
+    Language settings will be taken from environment variables again.
 
 Notes
 -----
 
-For backwards compatibility most subcommands can also be specified as a long or short option. For example, rather than ``status is-login`` you can type ``status --is-login``. The flag forms are deprecated and may be removed in a future release (but not before fish 4.0).
+For backwards compatibility most subcommands can also be specified as a long or short option. For example, rather than ``status is-login`` you can type ``status --is-login``. The flag forms are deprecated and may be removed in a future release.
 
 You can only specify one subcommand per invocation even if you use the flag form of the subcommand.

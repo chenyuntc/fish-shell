@@ -17,7 +17,7 @@ import unicodedata
 try:
     from itertools import zip_longest
 except ImportError:
-    from itertools import izip_longest as zip_longest
+    from itertools import izip_longest as zip_longest  # type: ignore
 
 
 # Directives can occur at the beginning of a line, or anywhere in a line that does not start with #.
@@ -41,7 +41,7 @@ SKIP = object()
 def find_command(program):
     import os
 
-    path, name = os.path.split(program)
+    path, _ = os.path.split(program)
     if path:
         return os.path.isfile(program) and os.access(program, os.X_OK)
     for path in os.environ["PATH"].split(os.pathsep):
@@ -302,6 +302,8 @@ class TestFailure(object):
                             if a
                             else ""
                         )
+                        # Convince type checker that bstr will in fact be a string when read.
+                        bstr = ""
                         if b:
                             bstr = (
                                 "on line "
@@ -385,21 +387,17 @@ def runproc(cmd, env=None):
     return asyncio.run(runproc_async(cmd, env=env))
 
 
-async def runproc_async(cmd, env=None):
+async def runproc_async(cmd, env=None, cwd=None):
     """Wrapper around subprocess.Popen to save typing"""
     PIPE = asyncio.subprocess.PIPE
     DEVNULL = asyncio.subprocess.DEVNULL
     return await asyncio.create_subprocess_shell(
-        cmd,
-        stdin=DEVNULL,
-        stdout=PIPE,
-        stderr=PIPE,
-        env=env,
+        cmd, stdin=DEVNULL, stdout=PIPE, stderr=PIPE, env=env, cwd=cwd
     )
 
 
 class TestRun(object):
-    def __init__(self, name, runcmd, checker, subs, config, env=None):
+    def __init__(self, name, runcmd, checker, subs, config, env=None, cwd=None):
         self.name = name
         self.runcmd = runcmd
         self.subbed_command = perform_substitution(runcmd.args, subs)
@@ -407,6 +405,7 @@ class TestRun(object):
         self.subs = subs
         self.config = config
         self.env = env
+        self.cwd = cwd
 
     def check(self, lines, checks):
         # Reverse our lines and checks so we can pop off the end.
@@ -496,13 +495,19 @@ class TestRun(object):
 
         if self.config.verbose:
             print(self.subbed_command)
-        proc = await runproc_async(self.subbed_command, env=self.env)
+        proc = await runproc_async(self.subbed_command, env=self.env, cwd=self.cwd)
         stdout, stderr = await proc.communicate()
+
+        # Work around type system limitations / bad API design which makes the typechecker unhappy.
+        if proc.returncode is None:
+            raise RuntimeError(
+                "After `proc.communicate()` the return code must be an int."
+            )
+        status = proc.returncode
         # HACK: This is quite cheesy: POSIX specifies that sh should return 127 for a missing command.
         # It's also possible that it'll be returned in other situations,
         # most likely when the last command in a shell script doesn't exist.
         # So we check if the command *we execute* exists, and complain then.
-        status = proc.returncode
         cmd = next(
             (
                 word
@@ -594,8 +599,7 @@ class CheckCmd(object):
         raise NotImplementedError
 
     @staticmethod
-    def parse(line, checktype):
-        # type: (Line) -> CheckCmd
+    def parse(line: Line, checktype: str) -> "CheckCmd":
         # Everything inside {{}} is a regular expression.
         # Everything outside of it is a literal string.
         # Split around {{...}}. Then every odd index will be a regex, and
@@ -613,8 +617,14 @@ class CheckCmd(object):
         pieces = bracket_re.split(line.text)
         even = True
         re_strings = []
-        for piece in pieces:
+        for i, piece in enumerate(pieces):
             if even:
+                if i != 0 and piece.startswith("}"):
+                    raise CheckerError(
+                        "Expression ('{{%s}}}') is ambiguous, consider using '{{%s}}{{[}]}}' if you really mean that"
+                        % (pieces[i - 1], pieces[i - 1]),
+                        line,
+                    )
                 # piece is a literal string.
                 re_strings.append(re.escape(piece))
             else:
@@ -682,7 +692,9 @@ def check_file(input_file, name, subs, config, failure_handler, env=None):
     )
 
 
-async def check_file_async(input_file, name, subs, config, failure_handler, env=None):
+async def check_file_async(
+    input_file, name, subs, config, failure_handler, env=None, cwd=None
+):
     """Check a single file. Return a True on success, False on error."""
     success = True
     lines = Line.readfile(input_file, name)
@@ -691,8 +703,15 @@ async def check_file_async(input_file, name, subs, config, failure_handler, env=
     # Run all the REQUIRES lines first,
     # if any of them fail it's a SKIP
     for reqcmd in checker.requirecmds:
-        proc = await runproc_async(perform_substitution(reqcmd.args, subs), env=env)
+        proc = await runproc_async(
+            perform_substitution(reqcmd.args, subs), env=env, cwd=cwd
+        )
         await proc.communicate()
+        # Work around type system limitations / bad API design which makes the typechecker unhappy.
+        if proc.returncode is None:
+            raise RuntimeError(
+                "After `proc.communicate()` the return code must be an int."
+            )
         if proc.returncode > 0:
             return SKIP
 
@@ -702,7 +721,7 @@ async def check_file_async(input_file, name, subs, config, failure_handler, env=
     # Only then run the RUN lines.
     for runcmd in checker.runcmds:
         failure = await TestRun(
-            name, runcmd, checker, subs, config, env=env
+            name, runcmd, checker, subs, config, env=env, cwd=cwd
         ).run_async()
         if failure:
             failure_handler(failure)
@@ -714,9 +733,11 @@ def check_path(path, subs, config, failure_handler, env=None):
     return asyncio.run(check_path_async(path, subs, config, failure_handler, env=env))
 
 
-async def check_path_async(path, subs, config, failure_handler, env=None):
+async def check_path_async(path, subs, config, failure_handler, env=None, cwd=None):
     with io.open(path, encoding="utf-8") as fd:
-        return await check_file_async(fd, path, subs, config, failure_handler, env=env)
+        return await check_file_async(
+            fd, path, subs, config, failure_handler, env=env, cwd=cwd
+        )
 
 
 def parse_subs(subs):

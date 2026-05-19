@@ -1,44 +1,36 @@
-use crate::common::wcs2zstring;
 use crate::env::{
-    is_read_only, ElectricVar, EnvMode, EnvStackSetResult, EnvVar, EnvVarFlags, Statuses, VarTable,
-    ELECTRIC_VARIABLES, PATH_ARRAY_SEP,
+    ELECTRIC_VARIABLES, ElectricVar, EnvMode, EnvSetMode, EnvStackSetResult, EnvVar, EnvVarFlags,
+    PATH_ARRAY_SEP, Statuses, VarTable, is_read_only,
 };
 use crate::env_universal_common::EnvUniversal;
-use crate::flog::FLOG;
+use crate::flog::flog;
 use crate::global_safety::RelaxedAtomicBool;
-use crate::history::{history_session_id_from_var, History};
+use crate::history::{History, history_id_from_var};
 use crate::kill::kill_entries;
-use crate::nix::umask;
 use crate::null_terminated_array::OwningNullTerminatedArray;
+use crate::portable_atomic::AtomicU64;
+use crate::prelude::*;
 use crate::reader::{commandline_get_state, reader_status_count};
 use crate::threads::{is_forked_child, is_main_thread};
-use crate::wchar::prelude::*;
 use crate::wutil::fish_wcstol_radix;
-
-use once_cell::sync::Lazy;
+use fish_widestring::wcs2zstring;
+use nix::sys::stat::{Mode, umask};
 use std::cell::{RefCell, UnsafeCell};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::marker::PhantomData;
 use std::mem;
 use std::ops::{Deref, DerefMut};
-
-#[cfg(not(target_has_atomic = "64"))]
-use portable_atomic::AtomicU64;
-#[cfg(target_has_atomic = "64")]
-use std::sync::atomic::AtomicU64;
-use std::sync::{atomic::Ordering, Arc, Mutex, MutexGuard};
+use std::sync::LazyLock;
+use std::sync::{Arc, Mutex, MutexGuard, atomic::Ordering};
 
 /// Getter for universal variables.
 /// This is typically initialized in env_init(), and is considered empty before then.
 pub fn uvars() -> MutexGuard<'static, EnvUniversal> {
-    use std::sync::OnceLock;
+    use std::sync::LazyLock;
     /// Universal variables instance.
-    static UVARS: OnceLock<Mutex<EnvUniversal>> = OnceLock::new();
-    UVARS
-        .get_or_init(|| Mutex::new(EnvUniversal::new()))
-        .lock()
-        .unwrap()
+    static UVARS: LazyLock<Mutex<EnvUniversal>> = LazyLock::new(|| Mutex::new(EnvUniversal::new()));
+    UVARS.lock().unwrap()
 }
 
 /// Whether we were launched with no_config; in this case setting a uvar instead sets a global.
@@ -55,7 +47,7 @@ pub fn colon_split<T: AsRef<wstr>>(val: &[T]) -> Vec<WString> {
 
 /// Return true if a variable should become a path variable by default. See #436.
 fn variable_should_auto_pathvar(name: &wstr) -> bool {
-    name.ends_with("PATH")
+    name.ends_with("PATH") || name == "LANGUAGE"
 }
 
 /// We cache our null-terminated export list. However an exported variable may change for lots of
@@ -85,7 +77,8 @@ fn set_umask(list_val: &[WString]) -> EnvStackSetResult {
         return EnvStackSetResult::Invalid;
     }
     // Do not actually create a umask variable. On env_stack_t::get() it will be calculated.
-    umask(mask as libc::mode_t);
+    // We already checked that `mask` is in range 0..=0o777.
+    umask(Mode::from_bits(mask as libc::mode_t).unwrap());
     EnvStackSetResult::Ok
 }
 
@@ -116,11 +109,20 @@ struct Query {
     pub user: bool,
 }
 
+impl From<EnvMode> for Query {
+    fn from(mode: EnvMode) -> Self {
+        Self::new(mode, false)
+    }
+}
+impl From<EnvSetMode> for Query {
+    fn from(mode: EnvSetMode) -> Self {
+        Self::new(mode.mode, mode.user)
+    }
+}
 impl Query {
     /// Creates a `Query` from env mode flags.
-    fn new(mode: EnvMode) -> Self {
-        let has_scope = mode
-            .intersects(EnvMode::LOCAL | EnvMode::FUNCTION | EnvMode::GLOBAL | EnvMode::UNIVERSAL);
+    fn new(mode: EnvMode, user: bool) -> Self {
+        let has_scope = mode.intersects(EnvMode::ANY_SCOPE);
         let has_export_unexport = mode.intersects(EnvMode::EXPORT | EnvMode::UNEXPORT);
         Query {
             has_scope,
@@ -138,7 +140,7 @@ impl Query {
             pathvar: mode.contains(EnvMode::PATHVAR),
             unpathvar: mode.contains(EnvMode::UNPATHVAR),
 
-            user: mode.contains(EnvMode::USER),
+            user,
         }
     }
 
@@ -222,7 +224,7 @@ impl Deref for EnvNodeRef {
     type Target = RefCell<EnvNode>;
 
     fn deref(&self) -> &Self::Target {
-        &self.0 .0
+        &self.0.0
     }
 }
 
@@ -285,7 +287,7 @@ impl Iterator for EnvNodeIter {
     }
 }
 
-static GLOBAL_NODE: Lazy<EnvNodeRef> = Lazy::new(|| EnvNodeRef::new(false, None));
+static GLOBAL_NODE: LazyLock<EnvNodeRef> = LazyLock::new(|| EnvNodeRef::new(false, None));
 
 /// Recursive helper to snapshot a series of nodes.
 fn copy_node_chain(node: &EnvNodeRef) -> EnvNodeRef {
@@ -341,7 +343,7 @@ impl EnvScopedImpl {
         }
     }
 
-    pub fn get_last_statuses(&self) -> &Statuses {
+    pub fn last_statuses(&self) -> &Statuses {
         &self.perproc_data.statuses
     }
 
@@ -368,13 +370,13 @@ impl EnvScopedImpl {
             }
             let history = commandline_get_state(true).history.unwrap_or_else(|| {
                 let fish_history_var = self.getf(L!("fish_history"), EnvMode::default());
-                let session_id = history_session_id_from_var(fish_history_var);
-                History::with_name(&session_id)
+                let history_id = history_id_from_var(fish_history_var);
+                History::new(history_id)
             });
-            return Some(EnvVar::new_from_name_vec(
+            Some(EnvVar::new_from_name_vec(
                 L!("history"),
                 history.get_history(),
-            ));
+            ))
         } else if key == "fish_killring" {
             Some(EnvVar::new_from_name_vec(
                 L!("fish_killring"),
@@ -407,12 +409,15 @@ impl EnvScopedImpl {
             // note umask() is an absurd API: you call it to set the value and it returns the old
             // value. Thus we have to call it twice, to reset the value. The env_lock protects
             // against races. Guess what the umask is; if we guess right we don't need to reset it.
-            let guess: libc::mode_t = 0o022;
-            let res: libc::mode_t = umask(guess);
+            let guess = Mode::S_IWGRP | Mode::S_IWOTH;
+            let res = umask(guess);
             if res != guess {
                 umask(res);
             }
-            Some(EnvVar::new_from_name(L!("umask"), sprintf!("0%0.3o", res)))
+            Some(EnvVar::new_from_name(
+                L!("umask"),
+                sprintf!("0%0.3o", res.bits()),
+            ))
         } else {
             // We should never get here unless the electric var list is out of sync with the above code.
             panic!("Unrecognized computed var name {}", key);
@@ -459,7 +464,7 @@ impl EnvScopedImpl {
     }
 
     pub fn getf(&self, key: &wstr, mode: EnvMode) -> Option<EnvVar> {
-        let query = Query::new(mode);
+        let query = Query::from(mode);
         let mut result: Option<EnvVar> = None;
         // Computed variables are effectively global and can't be shadowed.
         if query.global {
@@ -489,7 +494,7 @@ impl EnvScopedImpl {
     }
 
     pub fn get_names(&self, flags: EnvMode) -> Vec<WString> {
-        let query = Query::new(flags);
+        let query = Query::from(flags);
         let mut names: HashSet<WString> = HashSet::new();
 
         // Helper to add the names of variables from `envs` to names, respecting show_exported and
@@ -585,15 +590,15 @@ impl EnvScopedImpl {
 
         let mut cursor = self.export_array_generations.iter().fuse();
         let mut mismatch = false;
-        self.enumerate_generations(|gen| {
-            if cursor.next().cloned() != Some(gen) {
+        self.enumerate_generations(|r#gen| {
+            if cursor.next().copied() != Some(r#gen) {
                 mismatch = true;
             }
         });
         if cursor.next().is_some() {
             mismatch = true;
         }
-        return mismatch;
+        mismatch
     }
 
     /// Get the exported variables into a variable table.
@@ -619,7 +624,7 @@ impl EnvScopedImpl {
 
     /// Return a newly allocated export array.
     fn create_export_array(&self) -> Arc<OwningNullTerminatedArray> {
-        FLOG!(env_export, "create_export_array() recalc");
+        flog!(env_export, "create_export_array() recalc");
         let mut vals = VarTable::new();
         Self::get_exported(&self.globals, &mut vals);
         Self::get_exported(&self.locals, &mut vals);
@@ -640,13 +645,13 @@ impl EnvScopedImpl {
 
         // Construct the export list: a list of strings of the form key=value.
         let mut export_list: Vec<CString> = Vec::with_capacity(vals.len());
-        for (key, val) in vals.into_iter() {
+        for (key, val) in vals {
             let mut str = key;
             str.push('=');
             str.push_utfstr(&val.as_string());
             export_list.push(wcs2zstring(&str));
         }
-        return Arc::new(OwningNullTerminatedArray::new(export_list));
+        Arc::new(OwningNullTerminatedArray::new(export_list))
     }
 
     // Exported variable array used by execv.
@@ -657,10 +662,10 @@ impl EnvScopedImpl {
 
             // Have to pull this into a local to satisfy the borrow checker.
             let mut generations = std::mem::take(&mut self.export_array_generations);
-            self.enumerate_generations(|gen| generations.push(gen));
+            self.enumerate_generations(|r#gen| generations.push(r#gen));
             self.export_array_generations = generations;
         }
-        return self.export_array.as_ref().unwrap().clone();
+        self.export_array.as_ref().unwrap().clone()
     }
 }
 
@@ -721,8 +726,8 @@ impl EnvStackImpl {
     }
 
     /// Set a variable under the name `key`, using the given `mode`, setting its value to `val`.
-    pub fn set(&mut self, key: &wstr, mode: EnvMode, mut val: Vec<WString>) -> ModResult {
-        let query = Query::new(mode);
+    pub fn set(&mut self, key: &wstr, mode: EnvSetMode, mut val: Vec<WString>) -> ModResult {
+        let query = Query::from(mode);
         // Handle electric and read-only variables.
         if let Some(ret) = self.try_set_electric(key, &query, &mut val) {
             return ModResult::new(ret);
@@ -754,6 +759,7 @@ impl EnvStackImpl {
                 result.uvar_modified = true;
             } else if query.global || (query.universal && UVAR_SCOPE_IS_GLOBAL.load()) {
                 Self::set_in_node(&mut self.base.globals, key, val, flags);
+                result.global_modified = true;
             } else if query.local {
                 assert!(
                     !self.base.locals.ptr_eq(&self.base.globals),
@@ -802,8 +808,8 @@ impl EnvStackImpl {
     }
 
     /// Remove a variable under the name `key`.
-    pub fn remove(&mut self, key: &wstr, mode: EnvMode) -> ModResult {
-        let query = Query::new(mode);
+    pub fn remove(&mut self, key: &wstr, mode: EnvSetMode) -> ModResult {
+        let query = Query::from(mode);
         // Users can't remove read-only keys.
         if query.user && is_read_only(key) {
             return ModResult::new(EnvStackSetResult::Scope);
@@ -968,7 +974,7 @@ impl EnvStackImpl {
         if key == "umask" {
             return Some(set_umask(val));
         } else if key == "PWD" {
-            assert!(val.len() == 1, "Should have exactly one element in PWD");
+            assert_eq!(val.len(), 1, "Should have exactly one element in PWD");
             let pwd = val.pop().unwrap();
             if pwd != self.base.perproc_data.pwd {
                 self.base.perproc_data.pwd = pwd;
@@ -986,7 +992,7 @@ impl EnvStackImpl {
             pathvar: Some(false),
         };
         Self::set_in_node(&mut self.base.globals, key, val, flags);
-        return Some(EnvStackSetResult::Ok);
+        Some(EnvStackSetResult::Ok)
     }
 
     /// Set a universal variable, inheriting as applicable from the given old variable.
@@ -1068,7 +1074,7 @@ impl EnvStackImpl {
                 return cursor;
             }
         }
-        return self.base.globals.clone();
+        self.base.globals.clone()
     }
 
     /// Get an existing variable, or None.
@@ -1155,23 +1161,29 @@ impl<T> EnvMutex<T> {
 unsafe impl<T> Sync for EnvMutex<T> {}
 unsafe impl<T> Send for EnvMutex<T> {}
 
-#[test]
-fn test_colon_split() {
-    assert_eq!(colon_split(&[L!("foo")]), &[L!("foo")]);
-    assert_eq!(
-        colon_split(&[L!("foo:bar:baz")]),
-        &[L!("foo"), L!("bar"), L!("baz")]
-    );
-    assert_eq!(
-        colon_split(&[L!("foo:bar"), L!("baz")]),
-        &[L!("foo"), L!("bar"), L!("baz")]
-    );
-    assert_eq!(
-        colon_split(&[L!("foo:bar"), L!("baz")]),
-        &[L!("foo"), L!("bar"), L!("baz")]
-    );
-    assert_eq!(
-        colon_split(&[L!("1:"), L!("2:"), L!(":3:")]),
-        &[L!("1"), L!(""), L!("2"), L!(""), L!(""), L!("3"), L!("")]
-    );
+#[cfg(test)]
+mod tests {
+    use super::colon_split;
+    use crate::prelude::*;
+
+    #[test]
+    fn test_colon_split() {
+        assert_eq!(colon_split(&[L!("foo")]), &[L!("foo")]);
+        assert_eq!(
+            colon_split(&[L!("foo:bar:baz")]),
+            &[L!("foo"), L!("bar"), L!("baz")]
+        );
+        assert_eq!(
+            colon_split(&[L!("foo:bar"), L!("baz")]),
+            &[L!("foo"), L!("bar"), L!("baz")]
+        );
+        assert_eq!(
+            colon_split(&[L!("foo:bar"), L!("baz")]),
+            &[L!("foo"), L!("bar"), L!("baz")]
+        );
+        assert_eq!(
+            colon_split(&[L!("1:"), L!("2:"), L!(":3:")]),
+            &[L!("1"), L!(""), L!("2"), L!(""), L!(""), L!("3"), L!("")]
+        );
+    }
 }

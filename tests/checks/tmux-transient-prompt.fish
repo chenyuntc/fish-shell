@@ -1,7 +1,7 @@
 #RUN: %fish %s
 #REQUIRES: command -v tmux
 
-set -g isolated_tmux_fish_extra_args -C '
+isolated-tmux-start -C '
     function fish_prompt
         if set -q transient
             printf "> "
@@ -10,12 +10,10 @@ set -g isolated_tmux_fish_extra_args -C '
             printf "> full prompt > "
         end
     end
-    bind ctrl-j "set transient true; commandline -f repaint execute"
+    bind ctrl-x "set transient true; commandline -f repaint execute"
 '
 
-isolated-tmux-start
-
-isolated-tmux send-keys 'echo foo' C-j
+isolated-tmux send-keys 'echo foo' C-x
 tmux-sleep
 isolated-tmux capture-pane -p
 # CHECK: > echo foo
@@ -28,8 +26,9 @@ isolated-tmux send-keys C-u '
     function fish_prompt
         printf "\$ "
     end
-' C-l
-isolated-tmux send-keys Enter Enter
+'
+tmux-sleep
+isolated-tmux send-keys C-l Enter Enter
 tmux-sleep
 isolated-tmux capture-pane -p
 # CHECK: $
@@ -45,11 +44,46 @@ isolated-tmux send-keys C-u C-l '
             printf "transient line%d\n" 1 2
         end
     end
-' C-l
-isolated-tmux send-keys Enter
+'
+tmux-sleep
+isolated-tmux send-keys C-l Enter
 tmux-sleep
 isolated-tmux capture-pane -p
 # CHECK: final line1
 # CHECK: final line2
 # CHECK: transient line1
 # CHECK: transient line2
+
+# Test that multi-line initial prompt is properly cleared with single-line
+# final.
+isolated-tmux send-keys C-u C-l '
+    function fish_prompt
+        if contains -- --final-rendering $argv
+            echo "2> "
+        else
+            echo "transient prompt line"
+            echo "1> "
+        end
+    end
+'
+tmux-sleep
+isolated-tmux send-keys C-l 'echo foo' Enter
+tmux-sleep
+isolated-tmux capture-pane -p
+# CHECK: 2> echo foo
+# CHECK: foo
+# CHECK: transient prompt line
+# CHECK: 1>
+
+# Test that multi-line initial prompt is properly cleared with single-line
+# final.
+isolated-tmux send-keys C-u C-l
+isolated-tmux send-keys 'echo foo \\' Enter
+isolated-tmux send-keys bar Enter
+tmux-sleep
+isolated-tmux capture-pane -p
+# CHECK: 2> echo foo \
+# CHECK:        bar
+# CHECK: foo bar
+# CHECK: transient prompt line
+# CHECK: 1>

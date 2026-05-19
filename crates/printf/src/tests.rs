@@ -1,8 +1,8 @@
 use crate::arg::ToArg;
-use crate::locale::{Locale, C_LOCALE, EN_US_LOCALE};
-use crate::{sprintf_locale, Error, FormatString};
-use libc::c_char;
+use crate::locale::{C_LOCALE, EN_US_LOCALE, Locale};
+use crate::{Error, FormatString as _, sprintf_locale};
 use std::f64::consts::{E, PI, TAU};
+use std::ffi::CStr;
 use std::fmt;
 
 // sprintf, checking length
@@ -13,7 +13,7 @@ macro_rules! sprintf_check {
         $(,)? // optional trailing comma
     ) => {
         {
-            use unicode_width::UnicodeWidthStr;
+            use unicode_width::UnicodeWidthStr as _;
             let mut target = String::new();
             let mut args = [$($arg.to_arg()),*];
             let len = $crate::printf_c_locale(
@@ -77,7 +77,7 @@ impl fmt::Write for NullOutput {
 #[test]
 fn smoke() {
     assert_fmt!("Hello, %s!", "world"  => "Hello, world!");
-    assert_fmt!("Hello, %ls!", "world" => "Hello, world!");
+    assert_fmt!("Hello, %ls!", "world" => "Hello, world!"); // length modifier
     assert_fmt!("Hello, world! %d %%%%", 3 => "Hello, world! 3 %%");
     assert_fmt!("" => "");
 }
@@ -225,7 +225,7 @@ fn test_int() {
     assert_fmt!("%d", -123 => "-123");
     assert_fmt!("~%d~", 148 => "~148~");
     assert_fmt!("00%dxx", -91232 => "00-91232xx");
-    assert_fmt!("%x", -9232 => "ffffdbf0");
+    assert_fmt!("%x", -9232 => "ffffffffffffdbf0");
     assert_fmt!("%X", 432 => "1B0");
     assert_fmt!("%09X", 432 => "0000001B0");
     assert_fmt!("%9X", 432 => "      1B0");
@@ -234,6 +234,7 @@ fn test_int() {
     assert_fmt!("%2o", 4 => " 4");
     assert_fmt!("% 12d", -4 => "          -4");
     assert_fmt!("% 12d", 48 => "          48");
+    // with length modifier
     assert_fmt!("%ld", -4_i64 => "-4");
     assert_fmt!("%lld", -4_i64 => "-4");
     assert_fmt!("%lX", -4_i64 => "FFFFFFFFFFFFFFFC");
@@ -248,6 +249,7 @@ fn test_int() {
     assert_fmt!("%9X", 492 => "      1EC");
     assert_fmt!("% 12u", 4 => "           4");
     assert_fmt!("% 12u", 48 => "          48");
+    // with length modifier
     assert_fmt!("%lu", 4_u64 => "4");
     assert_fmt!("%llu", 4_u64 => "4");
     assert_fmt!("%lX", 4_u64 => "4");
@@ -398,8 +400,10 @@ fn test_char() {
 
 #[test]
 fn test_ptr() {
-    assert_fmt!("%p", core::ptr::null::<u8>() => "0");
-    assert_fmt!("%p", 0xDEADBEEF_usize as *const u8 => "0xdeadbeef");
+    assert_fmt!("%p", core::ptr::null::<()>() => "0");
+
+    let tmp = core::ptr::without_provenance::<()>(0xDEADBEEF);
+    assert_fmt!("%p", tmp => "0xdeadbeef");
 }
 
 #[test]
@@ -414,6 +418,7 @@ fn test_float() {
     assert_fmt1!("%f", 0.0, "0.000000");
     assert_fmt1!("%g", 0.0, "0");
     assert_fmt1!("%#g", 0.0, "0.00000");
+    // with length modifier
     assert_fmt1!("%la", 0.0, "0x0p+0");
     assert_fmt1!("%le", 0.0, "0.000000e+00");
     assert_fmt1!("%lf", 0.0, "0.000000");
@@ -430,7 +435,7 @@ fn test_float() {
     assert_fmt1!("%.4f", 1.03125, "1.0312"); /* 0x1.08p0 */
     assert_fmt1!("%.2f", 1.375, "1.38");
     assert_fmt1!("%.1f", 1.375, "1.4");
-    assert_fmt1!("%.1lf", 1.375, "1.4");
+    assert_fmt1!("%.1lf", 1.375, "1.4"); // length modifier
     assert_fmt1!("%.15f", 1.1, "1.100000000000000");
     assert_fmt1!("%.16f", 1.1, "1.1000000000000001");
     assert_fmt1!("%.17f", 1.1, "1.10000000000000009");
@@ -755,8 +760,8 @@ fn test_errors() {
     sprintf_err!("%1", => BadFormatString);
     sprintf_err!("%%%k", => BadFormatString);
     sprintf_err!("%B", =>  BadFormatString);
-    sprintf_err!("%lC", 'q' =>  BadFormatString);
-    sprintf_err!("%lS", 'q' =>  BadFormatString);
+    sprintf_err!("%lC", 'q' =>  BadFormatString); // length modifier
+    sprintf_err!("%lS", 'q' =>  BadFormatString); // length modifier
     sprintf_err!("%d", => MissingArg);
     sprintf_err!("%d %u", 1 => MissingArg);
     sprintf_err!("%*d", 5 => MissingArg);
@@ -852,25 +857,20 @@ fn test_float_hex_prec() {
     // Note that our hex float formatting rounds according to the rounding mode,
     // while libc may not; as a result we may differ in the last digit. So this
     // requires manual comparison.
-    let mut c_storage = [0u8; 256];
-    let c_storage_ptr = c_storage.as_mut_ptr() as *mut c_char;
     let mut rust_str = String::with_capacity(256);
 
-    let c_fmt = b"%.*a\0".as_ptr() as *const c_char;
+    let mut c_storage = [0u8; 256];
+    let mut libc_sprintf = libc_sprintf_one_float_with_precision(&mut c_storage, c"%.*a");
+
     let mut failed = false;
-    for sign in [1.0, -1.0].into_iter() {
-        for mut v in [0.0, 0.5, 1.0, 1.5, PI, TAU, E].into_iter() {
+    for sign in [1.0, -1.0] {
+        for mut v in [0.0, 0.5, 1.0, 1.5, PI, TAU, E] {
             v *= sign;
-            for preci in 1..=200_i32 {
+            for preci in 1..=200_usize {
                 rust_str.clear();
                 crate::sprintf!(=> &mut rust_str, "%.*a", preci, v);
 
-                let printf_str = unsafe {
-                    let len = libc::snprintf(c_storage_ptr, c_storage.len(), c_fmt, preci, v);
-                    assert!(len >= 0);
-                    let sl = std::slice::from_raw_parts(c_storage_ptr as *const u8, len as usize);
-                    std::str::from_utf8(sl).unwrap()
-                };
+                let printf_str = libc_sprintf(preci, v);
                 if rust_str != printf_str {
                     println!(
                         "Our printf and libc disagree on hex formatting of float: {v}
@@ -886,14 +886,33 @@ fn test_float_hex_prec() {
     assert!(!failed);
 }
 
-fn test_exhaustive(rust_fmt: &str, c_fmt: *const c_char) {
+fn libc_sprintf_one_float_with_precision<'a>(
+    storage: &'a mut [u8],
+    fmt: &'a CStr,
+) -> impl FnMut(usize, f64) -> &'a str {
+    |preci, float_val| unsafe {
+        let storage_ptr = storage.as_mut_ptr();
+        let len = libc::snprintf(
+            storage_ptr.cast(),
+            storage.len(),
+            fmt.as_ptr(),
+            preci,
+            float_val,
+        );
+        assert!(len >= 0);
+        let sl = std::slice::from_raw_parts(storage_ptr, len as usize);
+        std::str::from_utf8(sl).unwrap()
+    }
+}
+
+fn test_exhaustive(rust_fmt: &str, c_fmt: &CStr) {
     // "There's only 4 billion floats so test them all."
     // This tests a format string expected to be of the form "%.*g" or "%.*e".
     // That is, it takes a precision and a double.
     println!("Testing {rust_fmt}");
     let mut rust_str = String::with_capacity(128);
     let mut c_storage = [0u8; 128];
-    let c_storage_ptr = c_storage.as_mut_ptr() as *mut c_char;
+    let mut libc_sprintf = libc_sprintf_one_float_with_precision(&mut c_storage, c_fmt);
 
     for i in 0..=u32::MAX {
         if i % 1000000 == 0 {
@@ -905,12 +924,7 @@ fn test_exhaustive(rust_fmt: &str, c_fmt: *const c_char) {
             rust_str.clear();
             crate::sprintf!(=> &mut rust_str, rust_fmt, preci, ff);
 
-            let printf_str = unsafe {
-                let len = libc::snprintf(c_storage_ptr, c_storage.len(), c_fmt, preci, ff);
-                assert!(len >= 0);
-                let sl = std::slice::from_raw_parts(c_storage_ptr as *const u8, len as usize);
-                std::str::from_utf8(sl).unwrap()
-            };
+            let printf_str = libc_sprintf(preci, ff);
             if rust_str != printf_str {
                 println!(
                     "Rust and libc disagree on formatting float {i:x}: {ff}\n
@@ -929,19 +943,19 @@ fn test_exhaustive(rust_fmt: &str, c_fmt: *const c_char) {
 #[ignore]
 fn test_float_g_exhaustive() {
     // To run: cargo test test_float_g_exhaustive --release -- --ignored --nocapture
-    test_exhaustive("%.*g", b"%.*g\0".as_ptr() as *const c_char);
+    test_exhaustive("%.*g", c"%.*g");
 }
 
 #[test]
 #[ignore]
 fn test_float_e_exhaustive() {
     // To run: cargo test test_float_e_exhaustive --release -- --ignored --nocapture
-    test_exhaustive("%.*e", b"%.*e\0".as_ptr() as *const c_char);
+    test_exhaustive("%.*e", c"%.*e");
 }
 
 #[test]
 #[ignore]
 fn test_float_f_exhaustive() {
     // To run: cargo test test_float_f_exhaustive --release -- --ignored --nocapture
-    test_exhaustive("%.*f", b"%.*f\0".as_ptr() as *const c_char);
+    test_exhaustive("%.*f", c"%.*f");
 }

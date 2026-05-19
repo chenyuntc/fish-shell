@@ -2,19 +2,26 @@
 
 use super::prelude::*;
 use crate::{
-    env::{EnvMode, Environment},
-    fds::{wopen_dir, BEST_O_SEARCH},
+    env::{EnvMode, Environment as _},
+    err_fmt, err_raw, err_str,
+    fds::{BEST_O_SEARCH, wopen_dir},
+    parser::ParserEnvSetMode,
     path::path_apply_cdpath,
-    wutil::{normalize_path, wperror, wreadlink},
+    wutil::{normalize_path, wreadlink},
 };
 use errno::Errno;
-use libc::{fchdir, EACCES, ELOOP, ENOENT, ENOTDIR, EPERM};
-use std::{os::fd::AsRawFd, sync::Arc};
+use libc::{EACCES, ELOOP, ENOENT, ENOTDIR, EPERM};
+use nix::unistd::fchdir;
 
 // The cd builtin. Changes the current directory to the one specified or to $HOME if none is
 // specified. The directory can be relative to any directory in the CDPATH variable.
-pub fn cd(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
-    let Some(&cmd) = args.get(0) else {
+pub fn cd(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+    localizable_consts! {
+        DIR_DOES_NOT_EXIST
+        "The directory '%s' does not exist"
+    }
+
+    let Some(&cmd) = args.first() else {
         return Err(STATUS_INVALID_ARGS);
     };
 
@@ -37,9 +44,9 @@ pub fn cd(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
                 &tmpstr
             }
             None => {
-                streams
-                    .err
-                    .append(wgettext_fmt!("%ls: Could not find home directory\n", cmd));
+                err_str!("Could not find home directory")
+                    .cmd(cmd)
+                    .finish(streams);
                 return Err(STATUS_CMD_ERROR);
             }
         }
@@ -47,33 +54,21 @@ pub fn cd(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
 
     // Stop `cd ""` from crashing
     if dir_in.is_empty() {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Empty directory '%ls' does not exist\n",
-            cmd,
-            dir_in
-        ));
+        let mut err = err_fmt!("Empty directory '%s' does not exist", dir_in).cmd(cmd);
         if !parser.is_interactive() {
-            streams.err.append(parser.current_line());
-        };
+            err = err.stacktrace(parser);
+        }
+        err.finish(streams);
         return Err(STATUS_CMD_ERROR);
     }
 
     let pwd = vars.get_pwd_slash();
 
     let dirs = path_apply_cdpath(dir_in, &pwd, vars);
-    if dirs.is_empty() {
-        streams.err.append(wgettext_fmt!(
-            "%ls: The directory '%ls' does not exist\n",
-            cmd,
-            dir_in
-        ));
-
-        if !parser.is_interactive() {
-            streams.err.append(parser.current_line());
-        }
-
-        return Err(STATUS_CMD_ERROR);
-    }
+    assert!(
+        !dirs.is_empty(),
+        "dirs should always contains a least an abs path, or a rel path, or '<PWD>/...'"
+    );
 
     let mut best_errno = 0;
     let mut broken_symlink = WString::new();
@@ -87,94 +82,68 @@ pub fn cd(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
         let res = wopen_dir(&norm_dir, BEST_O_SEARCH).map_err(|err| err as i32);
 
         let res = res.and_then(|fd| {
-            if unsafe { fchdir(fd.as_raw_fd()) } == 0 {
-                Ok(fd)
-            } else {
-                Err(errno::errno().0)
-            }
+            fchdir(&fd).map_err(|_|
+                // nix::Result::Err contains nix::errno::Errno, which does not offer an API for
+                // converting to a raw int.
+                errno::errno().0)
         });
 
-        let fd = match res {
-            Ok(fd) => fd,
-            Err(err) => {
-                // Some errors we skip and only report if nothing worked.
-                // ENOENT in particular is very low priority
-                // - if in another directory there was a *file* by the correct name
-                // we prefer *that* error because it's more specific
-                if err == ENOENT {
-                    let tmp = wreadlink(&norm_dir);
-                    // clippy doesn't like this is_some/unwrap pair, but using if let is harder to read IMO
-                    #[allow(clippy::unnecessary_unwrap)]
-                    if broken_symlink.is_empty() && tmp.is_some() {
-                        broken_symlink = norm_dir;
-                        broken_symlink_target = tmp.unwrap();
-                    } else if best_errno == 0 {
-                        best_errno = errno::errno().0;
-                    }
-                    continue;
-                } else if err == ENOTDIR {
-                    best_errno = err;
-                    continue;
+        if let Err(err) = res {
+            // Some errors we skip and only report if nothing worked.
+            // ENOENT in particular is very low priority
+            // - if in another directory there was a *file* by the correct name
+            // we prefer *that* error because it's more specific
+            if err == ENOENT {
+                let tmp = wreadlink(&norm_dir);
+                // clippy doesn't like this is_some/unwrap pair, but using if let is harder to read IMO
+                // TODO: if-let-chains
+                if let Some(tmp) = tmp.filter(|_| broken_symlink.is_empty()) {
+                    broken_symlink = norm_dir;
+                    broken_symlink_target = tmp;
+                } else if best_errno == 0 {
+                    best_errno = errno::errno().0;
                 }
+                continue;
+            } else if err == ENOTDIR {
                 best_errno = err;
-                break;
+                continue;
             }
-        };
+            best_errno = err;
+            break;
+        }
 
-        // We need to keep around the fd for this directory, in the parser.
-        let dir_fd = Arc::new(fd);
-
-        // Stash the fd for the cwd in the parser.
-        parser.libdata_mut().cwd_fd = Some(dir_fd);
-
-        parser.set_var_and_fire(L!("PWD"), EnvMode::EXPORT | EnvMode::GLOBAL, vec![norm_dir]);
+        parser.set_var_and_fire(
+            L!("PWD"),
+            ParserEnvSetMode::new(EnvMode::EXPORT | EnvMode::GLOBAL),
+            vec![norm_dir],
+        );
         return Ok(SUCCESS);
     }
 
-    if best_errno == ENOTDIR {
-        streams.err.append(wgettext_fmt!(
-            "%ls: '%ls' is not a directory\n",
-            cmd,
-            dir_in
-        ));
+    let mut err = if best_errno == ENOTDIR {
+        err_fmt!("'%s' is not a directory", dir_in)
     } else if !broken_symlink.is_empty() {
-        streams.err.append(wgettext_fmt!(
-            "%ls: '%ls' is a broken symbolic link to '%ls'\n",
-            cmd,
+        err_fmt!(
+            "'%s' is a broken symbolic link to '%s'",
             broken_symlink,
             broken_symlink_target
-        ));
+        )
     } else if best_errno == ELOOP {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Too many levels of symbolic links: '%ls'\n",
-            cmd,
-            dir_in
-        ));
+        err_fmt!("Too many levels of symbolic links: '%s'", dir_in)
     } else if best_errno == ENOENT {
-        streams.err.append(wgettext_fmt!(
-            "%ls: The directory '%ls' does not exist\n",
-            cmd,
-            dir_in
-        ));
+        err_fmt!(DIR_DOES_NOT_EXIST, dir_in)
     } else if best_errno == EACCES || best_errno == EPERM {
-        streams.err.append(wgettext_fmt!(
-            "%ls: Permission denied: '%ls'\n",
-            cmd,
-            dir_in
-        ));
+        err_fmt!("Permission denied: '%s'", dir_in)
     } else {
         errno::set_errno(Errno(best_errno));
-        wperror(L!("cd"));
-        streams.err.append(wgettext_fmt!(
-            "%ls: Unknown error trying to locate directory '%ls'\n",
-            cmd,
-            dir_in
-        ));
-    }
+        err_raw!(builtin_strerror()).cmd(L!("cd")).finish(streams);
+        err_fmt!("Unknown error trying to locate directory '%s'", dir_in)
+    };
 
     if !parser.is_interactive() {
-        streams.err.append(parser.current_line());
+        err = err.stacktrace(parser);
     }
+    err.cmd(cmd).finish(streams);
 
-    return Err(STATUS_CMD_ERROR);
+    Err(STATUS_CMD_ERROR)
 }

@@ -1,3 +1,4 @@
+# localization: tier1
 function isatty -d "Tests if a file descriptor is a tty"
     set -l options h/help
     argparse -n isatty $options -- $argv
@@ -9,7 +10,10 @@ function isatty -d "Tests if a file descriptor is a tty"
     end
 
     if set -q argv[2]
-        printf (_ "%s: Too many arguments") isatty >&2
+        {
+            printf (_ "%s: Too many arguments") isatty
+            echo
+        } >&2
         return 1
     end
 

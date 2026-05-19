@@ -2,16 +2,17 @@ use super::prelude::*;
 use crate::ast::BlockStatement;
 use crate::common::{valid_func_name, valid_var_name};
 use crate::complete::complete_add_wrapper;
-use crate::env::environment::Environment;
+use crate::env::environment::Environment as _;
 use crate::env::is_read_only;
 use crate::event::{self, EventDescription, EventHandler};
-use crate::function;
 use crate::global_safety::RelaxedAtomicBool;
-use crate::nix::getpid;
+use crate::parse_execution::varname_error;
 use crate::parse_tree::NodeRef;
 use crate::parser_keywords::parser_keywords_is_reserved;
-use crate::proc::Pid;
+use crate::proc::{InternalJobId, Pid};
 use crate::signal::Signal;
+use crate::{err_fmt, err_str, function};
+use nix::unistd::getpid;
 use std::sync::Arc;
 
 struct FunctionCmdOpts {
@@ -40,7 +41,7 @@ impl Default for FunctionCmdOpts {
 
 // This command is atypical in using the "-" (RETURN_IN_ORDER) option for flag parsing.
 // This is needed due to the semantics of the -a/--argument-names flag.
-const SHORT_OPTIONS: &wstr = L!("-:a:d:e:hj:p:s:v:w:SV:");
+const SHORT_OPTIONS: &wstr = L!("-a:d:e:hj:p:s:v:w:SV:");
 #[rustfmt::skip]
 const LONG_OPTIONS: &[WOption] = &[
     wopt(L!("description"), ArgType::RequiredArgument, 'd'),
@@ -58,12 +59,12 @@ const LONG_OPTIONS: &[WOption] = &[
 
 /// Return the internal_job_id for a pid, or None if none.
 /// This looks through both active and finished jobs.
-fn job_id_for_pid(pid: Pid, parser: &Parser) -> Option<u64> {
+fn job_id_for_pid(pid: Pid, parser: &Parser) -> Option<InternalJobId> {
     if let Some(job) = parser.job_get_from_pid(pid) {
         Some(job.internal_job_id)
     } else {
         parser
-            .get_wait_handles()
+            .wait_handles()
             .get_by_pid(pid)
             .map(|h| h.internal_job_id)
     }
@@ -73,15 +74,40 @@ fn job_id_for_pid(pid: Pid, parser: &Parser) -> Option<u64> {
 /// Returns an exit status.
 fn parse_cmd_opts(
     opts: &mut FunctionCmdOpts,
-    optind: &mut usize,
     argv: &mut [&wstr],
     parser: &Parser,
     streams: &mut IoStreams,
-) -> c_int {
+) -> BuiltinResult {
     let cmd = L!("function");
     let print_hints = false;
     let mut handling_named_arguments = false;
     let mut w = WGetopter::new(SHORT_OPTIONS, LONG_OPTIONS, argv);
+
+    let mut validate_variable_name =
+        |streams: &mut IoStreams, varname: &wstr, read_only_ok: bool| {
+            if !valid_var_name(varname) {
+                varname_error(cmd, varname).finish(streams);
+                return Err(STATUS_INVALID_ARGS);
+            }
+            if !read_only_ok && is_read_only(varname) {
+                err_fmt!("variable '%s' is read-only", varname)
+                    .cmd(cmd)
+                    .finish(streams);
+                return Err(STATUS_INVALID_ARGS);
+            }
+            Ok(())
+        };
+    fn add_named_argument(
+        validate_variable_name: &mut impl FnMut(&mut IoStreams, &wstr, bool) -> Result<(), i32>,
+        streams: &mut IoStreams,
+        opts: &mut FunctionCmdOpts,
+        varname: &wstr,
+    ) -> Result<(), i32> {
+        validate_variable_name(streams, varname, /*read_only_ok=*/ false)?;
+        opts.named_arguments.push(varname.to_owned());
+        Ok::<(), ErrorCode>(())
+    }
+
     while let Some(opt) = w.next_opt() {
         // NON_OPTION_CHAR is returned when we reach a non-permuted non-option.
         if opt != 'a' && opt != NON_OPTION_CHAR {
@@ -90,24 +116,14 @@ fn parse_cmd_opts(
         match opt {
             NON_OPTION_CHAR => {
                 // A positional argument we got because we use RETURN_IN_ORDER.
-                let woptarg = w.woptarg.unwrap().to_owned();
+                let woptarg = w.woptarg.unwrap();
                 if handling_named_arguments {
-                    if is_read_only(&woptarg) {
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: variable '%ls' is read-only\n",
-                            cmd,
-                            woptarg
-                        ));
-                        return STATUS_INVALID_ARGS;
-                    }
-                    opts.named_arguments.push(woptarg);
+                    add_named_argument(&mut validate_variable_name, streams, opts, woptarg)?;
                 } else {
-                    streams.err.append(wgettext_fmt!(
-                        "%ls: %ls: unexpected positional argument",
-                        cmd,
-                        woptarg
-                    ));
-                    return STATUS_INVALID_ARGS;
+                    err_fmt!("%s: unexpected positional argument", woptarg)
+                        .cmd(cmd)
+                        .finish(streams);
+                    return Err(STATUS_INVALID_ARGS);
                 }
             }
             'd' => {
@@ -115,23 +131,16 @@ fn parse_cmd_opts(
             }
             's' => {
                 let Some(signal) = Signal::parse(w.woptarg.unwrap()) else {
-                    streams.err.append(wgettext_fmt!(
-                        "%ls: Unknown signal '%ls'",
-                        cmd,
-                        w.woptarg.unwrap()
-                    ));
-                    return STATUS_INVALID_ARGS;
+                    err_fmt!("Unknown signal '%s'", w.woptarg.unwrap())
+                        .cmd(cmd)
+                        .finish(streams);
+                    return Err(STATUS_INVALID_ARGS);
                 };
                 opts.events.push(EventDescription::Signal { signal });
             }
             'v' => {
                 let name = w.woptarg.unwrap().to_owned();
-                if !valid_var_name(&name) {
-                    streams
-                        .err
-                        .append(wgettext_fmt!(BUILTIN_ERR_VARNAME, cmd, name));
-                    return STATUS_INVALID_ARGS;
-                }
+                validate_variable_name(streams, &name, /*read_only_ok=*/ true)?;
                 opts.events.push(EventDescription::Variable { name });
             }
             'e' => {
@@ -145,38 +154,29 @@ fn parse_cmd_opts(
                     let caller_id = if parser.scope().is_subshell {
                         parser.scope().caller_id
                     } else {
-                        0
+                        InternalJobId::default()
                     };
-                    if caller_id == 0 {
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: calling job for event handler not found",
-                            cmd
-                        ));
-                        return STATUS_INVALID_ARGS;
+                    if caller_id == InternalJobId::default() {
+                        err_str!("calling job for event handler not found")
+                            .cmd(cmd)
+                            .finish(streams);
+                        return Err(STATUS_INVALID_ARGS);
                     }
                     e = EventDescription::CallerExit { caller_id };
                 } else if opt == 'p' && woptarg == "%self" {
-                    let pid = Pid::new(getpid());
-                    e = EventDescription::ProcessExit { pid };
+                    let pid = Pid::from_nix_pid_unchecked(getpid());
+                    e = EventDescription::ProcessExit { pid: Some(pid) };
                 } else {
-                    let Ok(pid @ 0..) = fish_wcstoi(woptarg) else {
-                        streams.err.append(wgettext_fmt!(
-                            "%ls: %ls: invalid process id",
-                            cmd,
-                            woptarg
-                        ));
-                        return STATUS_INVALID_ARGS;
-                    };
+                    let pid = parse_pid_may_be_zero(streams, cmd, woptarg)?;
                     if opt == 'p' {
-                        e = EventDescription::ProcessExit { pid: Pid::new(pid) };
+                        e = EventDescription::ProcessExit { pid };
                     } else {
                         // TODO: rationalize why a default of 0 is sensible.
-                        let internal_job_id = match Pid::new(pid) {
-                            Some(pid) => job_id_for_pid(pid, parser).unwrap_or(0),
-                            None => 0,
-                        };
+                        let internal_job_id = pid
+                            .and_then(|pid| job_id_for_pid(pid, parser))
+                            .unwrap_or_default();
                         e = EventDescription::JobExit {
-                            pid: Pid::new(pid),
+                            pid,
                             internal_job_id,
                         };
                     }
@@ -184,17 +184,13 @@ fn parse_cmd_opts(
                 opts.events.push(e);
             }
             'a' => {
-                let name = w.woptarg.unwrap().to_owned();
-                if is_read_only(&name) {
-                    streams.err.append(wgettext_fmt!(
-                        "%ls: variable '%ls' is read-only\n",
-                        cmd,
-                        name
-                    ));
-                    return STATUS_INVALID_ARGS;
-                }
                 handling_named_arguments = true;
-                opts.named_arguments.push(name);
+                add_named_argument(
+                    &mut validate_variable_name,
+                    streams,
+                    opts,
+                    w.woptarg.unwrap(),
+                )?;
             }
             'S' => {
                 opts.shadow_scope = false;
@@ -204,24 +200,36 @@ fn parse_cmd_opts(
             }
             'V' => {
                 let woptarg = w.woptarg.unwrap();
-                if !valid_var_name(woptarg) {
-                    streams
-                        .err
-                        .append(wgettext_fmt!(BUILTIN_ERR_VARNAME, cmd, woptarg));
-                    return STATUS_INVALID_ARGS;
-                }
+                validate_variable_name(streams, woptarg, /*read_only_ok=*/ false)?;
                 opts.inherit_vars.push(woptarg.to_owned());
             }
             'h' => {
                 opts.print_help = true;
             }
             ':' => {
-                builtin_missing_argument(parser, streams, cmd, argv[w.wopt_index - 1], print_hints);
-                return STATUS_INVALID_ARGS;
+                builtin_missing_argument(
+                    parser,
+                    streams,
+                    cmd,
+                    None,
+                    argv[w.wopt_index - 1],
+                    print_hints,
+                );
+                return Err(STATUS_INVALID_ARGS);
+            }
+            ';' => {
+                builtin_unexpected_argument(
+                    parser,
+                    streams,
+                    cmd,
+                    argv[w.wopt_index - 1],
+                    print_hints,
+                );
+                return Err(STATUS_INVALID_ARGS);
             }
             '?' => {
                 builtin_unknown_option(parser, streams, cmd, argv[w.wopt_index - 1], print_hints);
-                return STATUS_INVALID_ARGS;
+                return Err(STATUS_INVALID_ARGS);
             }
             other => {
                 panic!("Unexpected retval from WGetopter: {}", other);
@@ -229,8 +237,22 @@ fn parse_cmd_opts(
         }
     }
 
-    *optind = w.wopt_index;
-    STATUS_CMD_OK
+    let optind = w.wopt_index;
+    if argv.len() != optind {
+        if !opts.named_arguments.is_empty() {
+            // Remaining arguments are named arguments.
+            for &arg in argv[optind..].iter() {
+                add_named_argument(&mut validate_variable_name, streams, opts, arg)?;
+            }
+        } else {
+            err_fmt!("%s: unexpected positional argument", argv[optind],)
+                .cmd(cmd)
+                .finish(streams);
+            return Err(STATUS_INVALID_ARGS);
+        }
+    }
+
+    Ok(SUCCESS)
 }
 
 fn validate_function_name(
@@ -238,43 +260,41 @@ fn validate_function_name(
     function_name: &mut WString,
     cmd: &wstr,
     streams: &mut IoStreams,
-) -> c_int {
+) -> BuiltinResult {
     if argv.len() < 2 {
-        // This is currently impossible but let's be paranoid.
         streams
             .err
-            .append(wgettext_fmt!("%ls: function name required", cmd));
-        return STATUS_INVALID_ARGS;
+            .append(&wgettext_fmt!("%s: function name required", cmd));
+        return Err(STATUS_INVALID_ARGS);
     }
     *function_name = argv[1].to_owned();
     if !valid_func_name(function_name) {
-        streams.err.append(wgettext_fmt!(
-            "%ls: %ls: invalid function name",
-            cmd,
-            function_name,
-        ));
-        return STATUS_INVALID_ARGS;
+        err_fmt!("%s: invalid function name", function_name,)
+            .cmd(cmd)
+            .finish(streams);
+        return Err(STATUS_INVALID_ARGS);
     }
     if parser_keywords_is_reserved(function_name) {
-        streams.err.append(wgettext_fmt!(
-            "%ls: %ls: cannot use reserved keyword as function name",
-            cmd,
+        err_fmt!(
+            "%s: cannot use reserved keyword as function name",
             function_name
-        ));
-        return STATUS_INVALID_ARGS;
+        )
+        .cmd(cmd)
+        .finish(streams);
+        return Err(STATUS_INVALID_ARGS);
     }
-    STATUS_CMD_OK
+    Ok(SUCCESS)
 }
 
 /// Define a function. Calls into `function.rs` to perform the heavy lifting of defining a
 /// function. Note this isn't strictly a "builtin": it is called directly from parse_execution.
 /// That is why its signature is different from the other builtins.
 pub fn function(
-    parser: &Parser,
+    parser: &mut Parser,
     streams: &mut IoStreams,
     c_args: &mut [&wstr],
     func_node: NodeRef<BlockStatement>,
-) -> c_int {
+) -> BuiltinResult {
     // The wgetopt function expects 'function' as the first argument. Make a new vec with
     // that property. This is needed because this builtin has a different signature than the other
     // builtins.
@@ -285,48 +305,19 @@ pub fn function(
 
     // A valid function name has to be the first argument.
     let mut function_name = WString::new();
-    let mut retval = validate_function_name(argv, &mut function_name, cmd, streams);
-    if retval != STATUS_CMD_OK {
-        return retval;
-    }
+    validate_function_name(argv, &mut function_name, cmd, streams)?;
     let argv = &mut argv[1..];
 
     let mut opts = FunctionCmdOpts::default();
-    let mut optind = 0;
-    retval = parse_cmd_opts(&mut opts, &mut optind, argv, parser, streams);
-    if retval != STATUS_CMD_OK {
-        return retval;
-    }
+    parse_cmd_opts(&mut opts, argv, parser, streams)?;
 
     if opts.print_help {
         builtin_print_error_trailer(parser, streams.err, cmd);
-        return STATUS_CMD_OK;
-    }
-
-    if argv.len() != optind {
-        if !opts.named_arguments.is_empty() {
-            // Remaining arguments are named arguments.
-            for &arg in argv[optind..].iter() {
-                if !valid_var_name(arg) {
-                    streams
-                        .err
-                        .append(wgettext_fmt!(BUILTIN_ERR_VARNAME, cmd, arg));
-                    return STATUS_INVALID_ARGS;
-                }
-                opts.named_arguments.push(arg.to_owned());
-            }
-        } else {
-            streams.err.append(wgettext_fmt!(
-                "%ls: %ls: unexpected positional argument",
-                cmd,
-                argv[optind],
-            ));
-            return STATUS_INVALID_ARGS;
-        }
+        return Ok(SUCCESS);
     }
 
     // Extract the current filename.
-    let definition_file = parser.libdata().current_filename.clone();
+    let definition_file = parser.current_filename.borrow().clone();
 
     // Ensure inherit_vars is unique and then populate it.
     opts.inherit_vars.sort_unstable();
@@ -341,21 +332,12 @@ pub fn function(
         })
         .collect();
 
-    for named in &opts.named_arguments {
-        if !valid_var_name(named) {
-            streams
-                .err
-                .append(wgettext_fmt!(BUILTIN_ERR_VARNAME, cmd, named));
-            return STATUS_INVALID_ARGS;
-        }
-    }
-
     // We have what we need to actually define the function.
     let props = function::FunctionProperties {
         func_node,
         named_arguments: opts.named_arguments,
         // Function descriptions are extracted from scripts in `share` via
-        // `build_tools/fish_xgettext.fish`.
+        // `cargo xtask gettext update`.
         description: LocalizableString::from_external_source(opts.description),
         inherit_vars: inherit_vars.into_boxed_slice(),
         shadow_scope: opts.shadow_scope,
@@ -370,7 +352,7 @@ pub fn function(
     function::add(function_name.clone(), Arc::new(props));
 
     // Handle wrap targets by creating the appropriate completions.
-    for wt in opts.wrap_targets.into_iter() {
+    for wt in opts.wrap_targets {
         complete_add_wrapper(function_name.clone(), wt.clone());
     }
 
@@ -384,13 +366,13 @@ pub fn function(
     for ed in &opts.events {
         match *ed {
             EventDescription::ProcessExit { pid: Some(pid) } => {
-                let wh = parser.get_wait_handles().get_by_pid(pid);
+                let wh = parser.wait_handles().get_by_pid(pid);
                 if let Some(status) = wh.and_then(|wh| wh.status()) {
                     event::fire(parser, event::Event::process_exit(pid, status));
                 }
             }
             EventDescription::JobExit { pid: Some(pid), .. } => {
-                let wh = parser.get_wait_handles().get_by_pid(pid);
+                let wh = parser.wait_handles().get_by_pid(pid);
                 if let Some(wh) = wh {
                     if wh.is_completed() {
                         event::fire(parser, event::Event::job_exit(pid, wh.internal_job_id));
@@ -401,5 +383,5 @@ pub fn function(
         }
     }
 
-    STATUS_CMD_OK
+    Ok(SUCCESS)
 }

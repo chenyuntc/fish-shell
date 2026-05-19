@@ -62,7 +62,7 @@ function -a arg1 arg2 name2
 end
 #CHECKERR: {{.*}}checks/function.fish (line {{\d+}}): function: -a: invalid function name
 #CHECKERR: function -a arg1 arg2 name2
-#CHECKERR: ^
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~^
 function name3 --argument-names arg1 arg2
     echo hello
     echo goodbye
@@ -71,12 +71,12 @@ function --argument-names arg1 arg2 name4
 end
 #CHECKERR: {{.*}}checks/function.fish (line {{\d+}}): function: --argument-names: invalid function name
 #CHECKERR: function --argument-names arg1 arg2 name4
-#CHECKERR: ^
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
 function name5 abc --argument-names def
 end
 #CHECKERR: {{.*}}checks/function.fish (line {{\d+}}): function: abc: unexpected positional argument
 #CHECKERR: function name5 abc --argument-names def
-#CHECKERR: ^
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
 functions -q name1; and echo "Function name1 found"
 functions -q name2; or echo "Function name2 not found as expected"
 functions -q name3; and echo "Function name3 found"
@@ -108,23 +108,23 @@ test "$name3[3..-1]" = "$name3a[3..-1]"; and echo "3 = 3a"
 # Test the first two lines.
 string join \n -- $name1[1..2]
 #CHECK: # Defined in {{(?:(?!, copied).)*}}
-#CHECK: function name1 --argument-names arg1 --argument-names arg2
+#CHECK: function name1 --argument-names arg1 arg2
 string join \n -- $name1a[1..2]
 #CHECK: # Defined in {{.*}}, copied in {{.*}}
-#CHECK: function name1a --argument-names arg1 --argument-names arg2
+#CHECK: function name1a --argument-names arg1 arg2
 string join \n -- $name3[1..2]
 #CHECK: # Defined in {{(?:(?!, copied).)*}}
-#CHECK: function name3 --argument-names arg1 --argument-names arg2
+#CHECK: function name3 --argument-names arg1 arg2
 string join \n -- $name3a[1..2]
 #CHECK: # Defined in {{.*}}, copied in {{.*}}
-#CHECK: function name3a --argument-names arg1 --argument-names arg2
+#CHECK: function name3a --argument-names arg1 arg2
 
 function test
     echo banana
 end
 #CHECKERR: {{.*}}checks/function.fish (line {{\d+}}): function: test: cannot use reserved keyword as function name
 #CHECKERR: function test
-#CHECKERR: ^
+#CHECKERR: ^~~~~~~~~~~~^
 
 functions -q; or echo False
 #CHECK: False
@@ -147,12 +147,12 @@ rm -r $tmpdir
 functions -e foo
 
 function foo -p bar; end
-# CHECKERR: {{.*}}function.fish (line {{\d+}}): function: bar: invalid process id
+# CHECKERR: {{.*}}function.fish (line {{\d+}}): function: 'bar' is not a valid process ID
 # CHECKERR: function foo -p bar; end
 # CHECKERR: ^~~~~~~~~~~~~~~~~~~^
 
 function foo --argument-names "banana pajama"; end
-# CHECKERR: {{.*}}function.fish (line {{\d+}}): function: banana pajama: invalid variable name. See `help identifiers`
+# CHECKERR: {{.*}}function.fish (line {{\d+}}): function: banana pajama: invalid variable name. See `help language#shell-variable-and-function-names`
 # CHECKERR: function foo --argument-names "banana pajama"; end
 # CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
 
@@ -161,6 +161,11 @@ function foo --argument-names status; end
 # CHECKERR: {{.*}}function.fish (line {{\d+}}): function: variable 'status' is read-only
 # CHECKERR: function foo --argument-names status; end
 # CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+
+function foo --inherit-variable status; end
+# CHECKERR: {{.*}}function.fish (line {{\d+}}): function: variable 'status' is read-only
+# CHECKERR: function foo --inherit-variable status; end
+# CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
 
 echo status $status
 # CHECK: status 2
@@ -185,5 +190,76 @@ foo (function foo; echo after; end)
 function foo; echo before; end
 foo (functions --erase foo)
 # CHECKERR: error: Unknown function 'foo'
+
+function ()
+end
+# CHECKERR: {{.*}}/tests/checks/function.fish (line {{\d+}}): function: function name required
+# CHECKERR: function ()
+# CHECKERR: ^~~~~~~~~~^
+
+# Tests the --argument-names and --inherit-variable can overwrite argv
+function t --argument-names a argv c
+    echo $argv
+end
+t 1 2 3
+#CHECK: 2
+
+function t -a argv
+    echo $argv
+end
+t 1 2 3
+#CHECK: 1
+
+function outer
+    function inner -v argv -V argv
+        echo $argv
+    end
+    set -gx argv 4 5 6
+end
+outer 1 2 3
+#CHECK: 1 2 3
+
+for flag in --on-process-exit --on-job-exit
+    for invalid_pid in (math 2 ^ 31) -1 -(math 2 ^ 31)
+        function invalid $flag=$invalid_pid
+        end
+    end
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '2147483648' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '-1' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '-2147483648' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '2147483648' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '-1' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+    # CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: '-2147483648' is not a valid process ID
+    # CHECKERR:     function invalid $flag=$invalid_pid
+    # CHECKERR:     ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+end
+
+function handle_some_sig --on-signal SOME_SIG
+end
+#CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: Unknown signal 'SOME_SIG'
+#CHECKERR: function handle_some_sig --on-signal SOME_SIG
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+
+function handle_exit_invalid_pid -j caller
+end
+#CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: calling job for event handler not found
+#CHECKERR: function handle_exit_invalid_pid -j caller
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^
+
+function fn_with_args -- arg
+end
+#CHECKERR: {{.*}}/function.fish (line {{\d+}}): function: arg: unexpected positional argument
+#CHECKERR: function fn_with_args -- arg
+#CHECKERR: ^~~~~~~~~~~~~~~~~~~~~~~~~~~^
 
 exit 0

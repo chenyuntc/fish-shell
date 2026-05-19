@@ -1,4 +1,5 @@
-function ls --description "List contents of directory"
+# localization: skip(uses-apropos)
+function ls
     # Make ls use colors and show indicators if we are on a system that supports that feature and writing to stdout.
     #
 
@@ -37,6 +38,7 @@ function ls --description "List contents of directory"
     isatty stdout
     and set -a indicators_opt $__fish_ls_indicators_opt
 
+    # TODO(term-workaround)
     # Terminal.app doesn't set $COLORTERM or $CLICOLOR,
     # but the new FreeBSD ls requires either to be set,
     # before it will enable color.

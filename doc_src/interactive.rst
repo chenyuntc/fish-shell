@@ -1,11 +1,9 @@
-.. _interactive:
-
 Interactive use
 ===============
 
 Fish prides itself on being really nice to use interactively. That's down to a few features we'll explain in the next few sections.
 
-Fish is used by giving commands in the fish language, see :ref:`The Fish Language <language>` for information on that.
+Fish is used by giving commands in the fish language, see :doc:`The Fish Language <language>` for information on that.
 
 Help
 ----
@@ -54,11 +52,11 @@ It also provides a large number of program specific scripted completions. Most o
 
 - ``apt``, ``rpm`` and ``yum`` show installed or installable packages
 
-You can also write your own completions or install some you got from someone else. For that, see :ref:`Writing your own completions <completion-own>`.
+You can also write your own completions or install some you got from someone else. For that, see :doc:`Writing your own completions <completions>`.
 
-Completion scripts are loaded on demand, like :ref:`functions are <syntax-function-autoloading>`. The difference is the ``$fish_complete_path`` :ref:`list <variables-lists>` is used instead of ``$fish_function_path``. Typically you can drop new completions in ~/.config/fish/completions/name-of-command.fish and fish will find them automatically.
+Completion scripts are loaded on demand, like :ref:`functions are <syntax-function-autoloading>`. The difference is the ``$fish_complete_path`` :ref:`list <variables-lists>` is used instead of ``$fish_function_path``. Typically you can drop new completions in ``~/.config/fish/completions/<name-of-command>.fish`` and fish will find them automatically.
 
-.. _color:
+.. _syntax-highlighting:
 
 Syntax highlighting
 -------------------
@@ -74,15 +72,31 @@ Detected errors include:
 
 To customize the syntax highlighting, you can set the environment variables listed in the :ref:`Variables for changing highlighting colors <variables-color>` section.
 
-Fish also provides pre-made color themes you can pick with :doc:`fish_config <cmds/fish_config>`. Running just ``fish_config`` opens a browser interface, or you can use ``fish_config theme`` in the terminal.
+Fish also provides pre-made color themes you can pick with :doc:`fish_config <cmds/fish_config>`.
+Running just ``fish_config`` opens a browser interface, or you can use ``fish_config theme`` from fish::
 
-For example, to disable nearly all coloring::
-
-  fish_config theme choose None
+  # disable nearly all coloring
+  fish_config theme choose none
+  # restore fish's default theme
+  fish_config theme choose default
 
 Or, to see all themes, right in your terminal::
 
   fish_config theme show
+
+.. _syntax-highlighting-instant-update:
+
+To update the theme of all shell sessions without restarting them,
+first have those sessions define an :ref:`event handler <event>` by adding the following to your :ref:`config.fish <configuration>` and restarting them::
+
+    function apply-my-theme --on-variable=my_theme
+        fish_config theme choose $my_theme
+    end
+
+Then, set the corresponding :ref:`universal variable <variables-universal>` from any session::
+
+    > set -U my_theme lava
+    > set -U my_theme snow-day
 
 .. _variables-color:
 
@@ -91,11 +105,13 @@ Syntax highlighting variables
 
 The colors used by fish for syntax highlighting can be configured by changing the values of various variables. The value of these variables can be one of the colors accepted by the :doc:`set_color <cmds/set_color>` command.
 Options accepted by ``set_color`` like
+``--foreground=``,
 ``--background=``,
 ``--bold``,
 ``--dim``,
 ``--italics``,
 ``--reverse``,
+``--strikethrough``,
 ``--underline`` and
 ``--underline-color=``
 are also accepted.
@@ -119,7 +135,7 @@ Variable                                          Meaning
 .. envvar:: fish_color_end                        process separators like ``;`` and ``&``
 .. envvar:: fish_color_error                      syntax errors
 .. envvar:: fish_color_param                      ordinary command parameters
-.. envvar:: fish_color_valid_path                 parameters that are filenames (if the file exists)
+.. envvar:: fish_color_valid_path                 parameters and redirection targets that are filenames (if the file exists)
 .. envvar:: fish_color_option                     options starting with "-", up to the first "--" parameter
 .. envvar:: fish_color_comment                    comments like '# important'
 .. envvar:: fish_color_selection                  selected text in vi visual mode
@@ -138,14 +154,13 @@ Variable                                          Meaning
 
 ==========================================        =====================================================================
 
-If a variable isn't set or is empty, fish usually tries ``$fish_color_normal``, except for:
+If a variable isn't set or is empty after subtracting any ``--theme=THEME`` options,
+fish usually tries ``$fish_color_normal``, except for:
 
 - ``$fish_color_keyword``, where it tries ``$fish_color_command`` first.
 - ``$fish_color_option``, where it tries ``$fish_color_param`` first.
 - For ``$fish_color_valid_path``, if that doesn't have a color, but only modifiers, it adds those to the color that would otherwise be used,
   like ``$fish_color_param``. But if valid paths have a color, it uses that and adds in modifiers from the other color.
-
-.. _variables-color-pager:
 
 Pager color variables
 ^^^^^^^^^^^^^^^^^^^^^^^
@@ -236,8 +251,6 @@ You can also change these functions yourself by running ``funced fish_prompt`` a
 
 .. [#] The web interface runs purely locally on your computer and requires python to be installed.
 
-.. _greeting:
-
 Configurable greeting
 ---------------------
 
@@ -257,12 +270,12 @@ or you can script it by changing the function::
 
 save this in config.fish or :ref:`a function file <syntax-function-autoloading>`. You can also use :doc:`funced <cmds/funced>` and :doc:`funcsave <cmds/funcsave>` to edit it easily.
 
-.. _title:
-
 Programmable title
 ------------------
 
-When using most terminals, it is possible to set the text displayed in the titlebar of the terminal window. Fish does this by running the :doc:`fish_title <cmds/fish_title>` function. It is executed before and after a command and the output is used as a titlebar message.
+Most terminals allow setting the text displayed in the titlebar of the terminal window.
+Fish does this by running the :doc:`fish_title <cmds/fish_title>` function.
+It is executed before and after a command and the output is used as a titlebar message.
 
 The :doc:`status current-command <cmds/status>` builtin will always return the name of the job to be put into the foreground (or ``fish`` if control is returning to the shell) when the :doc:`fish_title <cmds/fish_title>` function is called. The first argument will contain the most recently executed foreground command as a string.
 
@@ -332,7 +345,8 @@ Some bindings are common across Emacs and vi mode, because they aren't text edit
 
 - :kbd:`ctrl-u` removes contents from the beginning of line to the cursor (moving it to the :ref:`killring <killring>`).
 
-- :kbd:`ctrl-l` clears and repaints the screen.
+- :kbd:`ctrl-l` pushes any text above the prompt to the terminal's scrollback,
+  then clears and repaints the screen.
 
 - :kbd:`ctrl-w` removes the previous path component (everything up to the previous "/", ":" or "@") (moving it to the :ref:`killring`).
 
@@ -351,6 +365,8 @@ Some bindings are common across Emacs and vi mode, because they aren't text edit
 - :kbd:`alt-h` (or :kbd:`f1`) shows the manual page for the current command, if one exists.
 
 - :kbd:`alt-l` lists the contents of the current directory, unless the cursor is over a directory argument, in which case the contents of that directory will be listed.
+
+.. _shared-binds-alt-o:
 
 - :kbd:`alt-o` opens the file at the cursor in a pager. If the cursor is in command position and the command is a script, it will instead open that script in your editor. The editor is chosen from the first available of the ``$VISUAL`` or ``$EDITOR`` variables.
 
@@ -449,7 +465,7 @@ The ``fish_vi_cursor`` function will be used to change the cursor's shape depend
    # Set the replace mode cursors to an underscore
    set fish_cursor_replace_one underscore
    set fish_cursor_replace underscore
-   # Set the external cursor to a line. The external cursor appears when a command is started. 
+   # Set the external cursor to a line. The external cursor appears when a command is started.
    # The cursor shape takes the value of fish_cursor_default when fish_cursor_external is not specified.
    set fish_cursor_external line
    # The following variable can be used to configure cursor shape in
@@ -563,8 +579,6 @@ Visual mode
 
 - :kbd:`",*,y` copies the selection to the clipboard, and enters :ref:`command mode <vi-mode-command>`.
 
-.. _custom-binds:
-
 Custom bindings
 ^^^^^^^^^^^^^^^
 
@@ -597,7 +611,7 @@ To find out the name of a key, you can use :doc:`fish_key_reader <cmds/fish_key_
   > fish_key_reader # Press Alt + right-arrow
   Press a key:
   bind alt-right 'do something'
-  
+
 Note that the historical way the terminal encodes keys and sends them to the application (fish, in this case) makes a lot of combinations indistinguishable or unbindable. In the usual encoding, :kbd:`ctrl-i` *is the same* as the tab key, and shift cannot be detected when ctrl is also pressed.
 
 There are more powerful encoding schemes, and fish tries to tell the terminal to turn them on, but there are still many terminals that do not support them. When ``fish_key_reader`` prints the same sequence for two different keys, then that is because your terminal sends the same sequence for them, and there isn't anything fish can do about it. It is our hope that these schemes will become more widespread, making input more flexible.

@@ -1,5 +1,3 @@
-.. _cmd-fish_clipboard_copy:
-
 fish_clipboard_copy - copy text to the system's clipboard
 ==============================================================
 
@@ -29,7 +27,7 @@ Currently supported are:
 - ``wl-copy`` using wayland
 - ``xsel`` and ``xclip`` for X11
 - ``clip.exe`` on Windows.
-- The OSC 52 clipboard sequence, which your terminal might support
+- The :ref:`OSC 52 clipboard sequence <term-compat-osc-52>`, which your terminal might support
 
 See also
 --------

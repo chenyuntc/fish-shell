@@ -1,5 +1,3 @@
-.. _cmd-read:
-
 read - read line of input into variables
 ========================================
 
@@ -64,7 +62,7 @@ The following options control the interactive mode:
     Masks characters written to the terminal, replacing them with asterisks. This is useful for reading things like passwords or other sensitive information.
 
 **-p** or **--prompt** *PROMPT_CMD*
-    Uses the output of the shell command *PROMPT_CMD* as the prompt for the interactive mode. The default prompt command is ``set_color green; echo -n read; set_color normal; echo -n "> "``
+    Uses the output of the shell command *PROMPT_CMD* as the prompt for the interactive mode. The default prompt command is ``set_color green; echo -n read; set_color --reset; echo -n "> "``
 
 **-P** or **--prompt-str** *PROMPT_STR*
     Uses the literal *PROMPT_STR* as the prompt for the interactive mode.
@@ -83,8 +81,12 @@ The following options control how much is read and how it is stored:
 **-n** or **--nchars** *NCHARS*
     Makes ``read`` return after reading *NCHARS* characters or the end of the line, whichever comes first.
 
-**-t** -or **--tokenize**
-    Causes read to split the input into variables by the shell's tokenization rules. This means it will honor quotes and escaping. This option is of course incompatible with other options to control splitting like **--delimiter** and does not honor :envvar:`IFS` (like fish's tokenizer). It saves the tokens in the manner they'd be passed to commands on the commandline, so e.g. ``a\ b`` is stored as ``a b``. Note that currently it leaves command substitutions intact along with the parentheses.
+**-t**, **--tokenize** or **--tokenize-raw**
+    Causes read to split the input into variables by the shell's tokenization rules.
+    This means it will honor quotes and escaping.
+    This option is of course incompatible with other options to control splitting like **--delimiter** and does not honor :envvar:`IFS` (like fish's tokenizer).
+    The **-t** -or **--tokenize** variants perform quote removal, so e.g. ``a\ b`` is stored as ``a b``.
+    However variables and command substitutions are not expanded.
 
 **-a** or **--list**
     Stores the result as a list in a single variable. This option is also available as **--array** for backwards compatibility.
@@ -93,7 +95,7 @@ The following options control how much is read and how it is stored:
     Marks the end of the line with the NUL character, instead of newline. This also disables interactive mode.
 
 **-L** or **--line**
-    Reads each line into successive variables, and stops after each variable has been filled. This cannot be combined with the ``--delimiter`` option.
+    Reads each line into successive variables, and stops after each variable has been filled. This cannot be combined with the ``--null`` option, or options to control splitting like ``--delimiter``.
 
 Without the ``--line`` option, ``read`` reads a single line of input from standard input, breaks it into tokens, and then assigns one token to each variable specified in *VARIABLES*. If there are more tokens than variables, the complete remainder is assigned to the last variable.
 

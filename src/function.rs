@@ -2,22 +2,28 @@
 // autoloading functions in the $fish_function_path. Actual function evaluation is taken care of by
 // the parser and to some degree the builtin handling library.
 
-use crate::ast::{self, Node};
-use crate::autoload::Autoload;
-use crate::common::{assert_sync, escape, valid_func_name, FilenameRef};
-use crate::complete::complete_wrap_map;
-use crate::env::{EnvStack, Environment};
-use crate::event::{self, EventDescription};
-use crate::global_safety::RelaxedAtomicBool;
-use crate::parse_tree::NodeRef;
-use crate::parser::Parser;
-use crate::parser_keywords::parser_keywords_is_reserved;
-use crate::wchar::prelude::*;
-use crate::wutil::{dir_iter::DirIter, sprintf};
-use once_cell::sync::Lazy;
-use std::collections::{HashMap, HashSet};
-use std::num::NonZeroU32;
-use std::sync::{Arc, Mutex};
+use crate::{
+    ast::{self, Node as _},
+    autoload::{Autoload, AutoloadResult},
+    common::valid_func_name,
+    complete::complete_wrap_map,
+    env::{EnvStack, Environment},
+    event::{self, EventDescription},
+    global_safety::RelaxedAtomicBool,
+    parse_tree::NodeRef,
+    parser::Parser,
+    parser_keywords::parser_keywords_is_reserved,
+    prelude::*,
+    proc::Pid,
+    wutil::dir_iter::DirIter,
+};
+use fish_common::{FilenameRef, assert_sync, escape};
+use fish_widestring::wcs2bytes;
+use std::{
+    collections::{HashMap, HashSet},
+    num::NonZeroU32,
+    sync::{Arc, LazyLock, Mutex},
+};
 
 #[derive(Clone)]
 pub struct FunctionProperties {
@@ -100,7 +106,7 @@ impl FunctionSet {
 }
 
 /// The big set of all functions.
-static FUNCTION_SET: Lazy<Mutex<FunctionSet>> = Lazy::new(|| {
+static FUNCTION_SET: LazyLock<Mutex<FunctionSet>> = LazyLock::new(|| {
     Mutex::new(FunctionSet {
         funcs: HashMap::new(),
         autoload_tombstones: HashSet::new(),
@@ -110,14 +116,14 @@ static FUNCTION_SET: Lazy<Mutex<FunctionSet>> = Lazy::new(|| {
 
 /// Make sure that if the specified function is a dynamically loaded function, it has been fully
 /// loaded. Note this executes fish script code.
-pub fn load(name: &wstr, parser: &Parser) -> bool {
+pub fn load(name: &wstr, parser: &mut Parser) -> bool {
     let mut path_to_autoload: Option<_> = None;
     // Note we can't autoload while holding the funcset lock.
     // Lock around a local region.
     {
         let mut funcset: std::sync::MutexGuard<FunctionSet> = FUNCTION_SET.lock().unwrap();
         if funcset.allow_autoload(name) {
-            if let Some(path) = funcset
+            if let AutoloadResult::Path(path) = funcset
                 .autoloader
                 .resolve_command(name, EnvStack::globals())
             {
@@ -207,7 +213,7 @@ pub fn get_props(name: &wstr) -> Option<Arc<FunctionProperties>> {
 }
 
 /// Return the properties for a function, or None, perhaps triggering autoloading.
-pub fn get_props_autoload(name: &wstr, parser: &Parser) -> Option<Arc<FunctionProperties>> {
+pub fn get_props_autoload(name: &wstr, parser: &mut Parser) -> Option<Arc<FunctionProperties>> {
     if parser_keywords_is_reserved(name) {
         return None;
     }
@@ -217,7 +223,7 @@ pub fn get_props_autoload(name: &wstr, parser: &Parser) -> Option<Arc<FunctionPr
 
 /// Returns true if the function named `cmd` exists.
 /// This may autoload.
-pub fn exists(cmd: &wstr, parser: &Parser) -> bool {
+pub fn exists(cmd: &wstr, parser: &mut Parser) -> bool {
     if !valid_func_name(cmd) {
         return false;
     }
@@ -240,7 +246,7 @@ pub fn exists_no_autoload(cmd: &wstr) -> bool {
         return true;
     }
 
-    let narrow = crate::common::wcs2string(cmd);
+    let narrow = wcs2bytes(cmd);
     if let Ok(cmdstr) = std::str::from_utf8(&narrow) {
         let cmd = "functions/".to_owned() + cmdstr + ".fish";
         crate::autoload::has_asset(&cmd)
@@ -283,7 +289,7 @@ fn get_function_body_source(props: &FunctionProperties) -> &wstr {
 
 /// Sets the description of the function with the name \c name.
 /// This triggers autoloading.
-pub(crate) fn set_desc(name: &wstr, desc: WString, parser: &Parser) {
+pub(crate) fn set_desc(name: &wstr, desc: WString, parser: &mut Parser) {
     load(name, parser);
     let mut funcset = FUNCTION_SET.lock().unwrap();
     if let Some(props) = funcset.funcs.get(name) {
@@ -301,7 +307,7 @@ pub(crate) fn set_desc(name: &wstr, desc: WString, parser: &Parser) {
 /// is successful.
 pub fn copy(name: &wstr, new_name: WString, parser: &Parser) -> bool {
     let filename = parser.current_filename();
-    let lineno = parser.get_lineno();
+    let lineno = parser.lineno();
 
     let mut funcset = FUNCTION_SET.lock().unwrap();
     let Some(props) = funcset.get_props(name) else {
@@ -318,7 +324,7 @@ pub fn copy(name: &wstr, new_name: WString, parser: &Parser) -> bool {
     // Note this will NOT overwrite an existing function with the new name.
     // TODO: rationalize if this behavior is desired.
     funcset.funcs.entry(new_name).or_insert(Arc::new(new_props));
-    return true;
+    true
 }
 
 /// Returns all function names.
@@ -336,14 +342,13 @@ pub fn get_names(get_hidden: bool, vars: &dyn Environment) -> Vec<WString> {
         names.insert(name.clone());
     }
 
-    #[cfg(feature = "embed-data")]
     for name in crate::autoload::Asset::iter() {
         let Some(bname) = name.strip_prefix("functions/") else {
             continue;
         };
         if !get_hidden && (bname.is_empty() || bname.starts_with('_')) {
             continue;
-        };
+        }
         let Some(fname) = bname.strip_suffix(".fish") else {
             continue;
         };
@@ -386,7 +391,6 @@ impl FunctionProperties {
     pub fn definition_lineno(&self) -> i32 {
         // Return one plus the number of newlines at offsets less than the start of our function's
         // statement (which includes the header).
-        // TODO: merge with line_offset_of_character_at_offset?
         let Some(source_range) = self.func_node.try_source_range() else {
             panic!("Function has no source range");
         };
@@ -405,9 +409,7 @@ impl FunctionProperties {
 
     /// If this function is a copy, return the original 1-based line number. Otherwise, return 0.
     pub fn copy_definition_lineno(&self) -> u32 {
-        self.copy_definition_lineno
-            .map(|val| val.get())
-            .unwrap_or(0)
+        self.copy_definition_lineno.map_or(0, |val| val.get())
     }
 
     /// Return a definition of the function, annotated with properties like event handlers and wrap
@@ -448,35 +450,36 @@ impl FunctionProperties {
             let d = &handler.desc;
             match d {
                 EventDescription::Signal { signal } => {
-                    sprintf!(=> &mut out, " --on-signal %ls", signal.name());
+                    sprintf!(=> &mut out, " --on-signal %s", signal.name());
                 }
                 EventDescription::Variable { name } => {
-                    sprintf!(=> &mut out, " --on-variable %ls", name);
+                    sprintf!(=> &mut out, " --on-variable %s", name);
                 }
                 EventDescription::ProcessExit { pid } => {
-                    let pid = pid.map(|p| p.get()).unwrap_or(0);
-                    sprintf!(=> &mut out, " --on-process-exit %d", pid)
+                    let pid = pid.as_ref().map_or(0, Pid::get);
+                    sprintf!(=> &mut out, " --on-process-exit %d", pid);
                 }
                 EventDescription::JobExit { pid, .. } => {
-                    let pid = pid.map(|p| p.get()).unwrap_or(0);
+                    let pid = pid.as_ref().map_or(0, Pid::get);
                     sprintf!(=> &mut out, " --on-job-exit %d", pid);
                 }
                 EventDescription::CallerExit { .. } => {
                     out.push_str(" --on-job-exit caller");
                 }
                 EventDescription::Generic { param } => {
-                    sprintf!(=> &mut out, " --on-event %ls", param);
+                    sprintf!(=> &mut out, " --on-event %s", param);
                 }
                 EventDescription::Any => {
                     panic!("Unexpected event handler type");
                 }
-            };
+            }
         }
 
         let named = &self.named_arguments;
         if !named.is_empty() {
+            sprintf!(=> &mut out, " --argument-names");
             for name in named {
-                sprintf!(=> &mut out, " --argument-names %ls", name);
+                sprintf!(=> &mut out, " %s", name);
             }
         }
 
@@ -490,7 +493,7 @@ impl FunctionProperties {
         for (name, values) in self.inherit_vars.iter() {
             // We don't know what indentation style the function uses,
             // so we do what fish_indent would.
-            sprintf!(=> &mut out, "\n    set -l %ls", name);
+            sprintf!(=> &mut out, "\n    set -l %s", name);
             for arg in values {
                 out.push(' ');
                 out.push_utfstr(&escape(arg));

@@ -1,19 +1,19 @@
 //! This file supports specifying and applying redirections.
 
 use crate::io::IoChain;
-use crate::wchar::prelude::*;
+use crate::prelude::*;
 use crate::wutil::fish_wcstoi;
 use nix::fcntl::OFlag;
 use std::os::fd::RawFd;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum RedirectionMode {
-    overwrite, // normal redirection: > file.txt
-    append,    // appending redirection: >> file.txt
-    input,     // input redirection: < file.txt
-    try_input, // try-input redirection: <? file.txt
-    fd,        // fd redirection: 2>&1
-    noclob,    // noclobber redirection: >? file.txt
+    Overwrite, // normal redirection: > file.txt
+    Append,    // appending redirection: >> file.txt
+    Input,     // input redirection: < file.txt
+    TryInput,  // try-input redirection: <? file.txt
+    Fd,        // fd redirection: 2>&1
+    NoClob,    // noclobber redirection: >? file.txt
 }
 
 /// A type that represents the action dup2(src, target).
@@ -36,10 +36,10 @@ impl RedirectionMode {
     /// The open flags for this redirection mode.
     pub fn oflags(self) -> Option<OFlag> {
         match self {
-            RedirectionMode::append => Some(OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_WRONLY),
-            RedirectionMode::overwrite => Some(OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC),
-            RedirectionMode::noclob => Some(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY),
-            RedirectionMode::input | RedirectionMode::try_input => Some(OFlag::O_RDONLY),
+            RedirectionMode::Append => Some(OFlag::O_CREAT | OFlag::O_APPEND | OFlag::O_WRONLY),
+            RedirectionMode::Overwrite => Some(OFlag::O_CREAT | OFlag::O_WRONLY | OFlag::O_TRUNC),
+            RedirectionMode::NoClob => Some(OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY),
+            RedirectionMode::Input | RedirectionMode::TryInput => Some(OFlag::O_RDONLY),
             _ => None,
         }
     }
@@ -69,7 +69,7 @@ impl RedirectionSpec {
     }
     /// Return if this is a close-type redirection.
     pub fn is_close(&self) -> bool {
-        self.mode == RedirectionMode::fd && self.target == "-"
+        self.mode == RedirectionMode::Fd && self.target == "-"
     }
 
     /// Attempt to parse target as an fd.
@@ -95,9 +95,9 @@ pub fn dup2_list_resolve_chain(io_chain: &IoChain) -> Dup2List {
     let mut result = Dup2List { actions: vec![] };
     for io in &io_chain.0 {
         if io.source_fd() < 0 {
-            result.add_close(io.fd())
+            result.add_close(io.fd());
         } else {
-            result.add_dup2(io.source_fd(), io.fd())
+            result.add_dup2(io.source_fd(), io.fd());
         }
     }
     result
@@ -149,6 +149,53 @@ impl Dup2List {
         self.actions.push(Dup2Action {
             src: fd,
             target: -1,
-        })
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::io::{IoChain, IoClose, IoFd};
+    use crate::redirection::dup2_list_resolve_chain;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_dup2s() {
+        let mut chain = IoChain::new();
+        chain.push(Arc::new(IoClose::new(17)));
+        chain.push(Arc::new(IoFd::new(3, 19)));
+        let list = dup2_list_resolve_chain(&chain);
+        assert_eq!(list.get_actions().len(), 2);
+
+        let act1 = list.get_actions()[0];
+        assert_eq!(act1.src, 17);
+        assert_eq!(act1.target, -1);
+
+        let act2 = list.get_actions()[1];
+        assert_eq!(act2.src, 19);
+        assert_eq!(act2.target, 3);
+    }
+
+    #[test]
+    fn test_dup2s_fd_for_target_fd() {
+        let mut chain = IoChain::new();
+        // note io_fd_t params are backwards from dup2.
+        chain.push(Arc::new(IoClose::new(10)));
+        chain.push(Arc::new(IoFd::new(9, 10)));
+        chain.push(Arc::new(IoFd::new(5, 8)));
+        chain.push(Arc::new(IoFd::new(1, 4)));
+        chain.push(Arc::new(IoFd::new(3, 5)));
+        let list = dup2_list_resolve_chain(&chain);
+
+        assert_eq!(list.fd_for_target_fd(3), 8);
+        assert_eq!(list.fd_for_target_fd(5), 8);
+        assert_eq!(list.fd_for_target_fd(8), 8);
+        assert_eq!(list.fd_for_target_fd(1), 4);
+        assert_eq!(list.fd_for_target_fd(4), 4);
+        assert_eq!(list.fd_for_target_fd(100), 100);
+        assert_eq!(list.fd_for_target_fd(0), 0);
+        assert_eq!(list.fd_for_target_fd(-1), -1);
+        assert_eq!(list.fd_for_target_fd(9), -1);
+        assert_eq!(list.fd_for_target_fd(10), -1);
     }
 }

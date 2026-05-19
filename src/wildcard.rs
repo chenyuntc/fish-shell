@@ -1,44 +1,34 @@
 // Enumeration of all wildcard types.
 
-use libc::X_OK;
-use std::cmp::Ordering;
-use std::collections::HashSet;
-use std::fs;
-
-use crate::common::{
-    char_offset, is_windows_subsystem_for_linux, unescape_string, UnescapeFlags,
-    UnescapeStringStyle, WILDCARD_RESERVED_BASE, WSL,
+use crate::{
+    common::{WSL, is_windows_subsystem_for_linux},
+    complete::{CompleteFlags, Completion, CompletionReceiver, PROG_COMPLETE_SEP},
+    expand::ExpandFlags,
+    prelude::*,
+    wutil::{
+        dir_iter::{DirEntry, DirEntryType},
+        lwstat, waccess,
+    },
 };
-use crate::complete::{CompleteFlags, Completion, CompletionReceiver, PROG_COMPLETE_SEP};
-use crate::expand::ExpandFlags;
-use crate::fallback::wcscasecmp;
-use crate::future_feature_flags::feature_test;
-use crate::future_feature_flags::FeatureFlag;
-use crate::wchar::prelude::*;
-use crate::wcstringutil::{
-    string_fuzzy_match_string, string_suffixes_string_case_insensitive, CaseSensitivity,
+use fish_common::{UnescapeFlags, UnescapeStringStyle, unescape_string};
+use fish_fallback::wcscasecmp;
+use fish_feature_flags::{FeatureFlag, feature_test};
+use fish_wcstringutil::{
+    CaseSensitivity, string_fuzzy_match_string, string_suffixes_string_case_insensitive,
+    strip_executable_suffix,
 };
-use crate::wutil::dir_iter::DirEntryType;
-use crate::wutil::{dir_iter::DirEntry, lwstat, waccess};
-use once_cell::sync::Lazy;
+use fish_widestring::{ANY_CHAR, ANY_STRING, ANY_STRING_RECURSIVE};
+use nix::unistd::AccessFlags;
+use std::{cell::LazyCell, cmp::Ordering, collections::HashSet, os::unix::fs::MetadataExt as _};
 
-static COMPLETE_EXEC_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("command"));
-static COMPLETE_EXEC_LINK_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("command link"));
-static COMPLETE_FILE_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("file"));
-static COMPLETE_SYMLINK_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("symlink"));
-static COMPLETE_DIRECTORY_SYMLINK_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("dir symlink"));
-static COMPLETE_DIRECTORY_DESC: Lazy<&wstr> = Lazy::new(|| wgettext!("directory"));
-
-/// Character representing any character except '/' (slash).
-pub const ANY_CHAR: char = char_offset(WILDCARD_RESERVED_BASE, 0);
-/// Character representing any character string not containing '/' (slash).
-pub const ANY_STRING: char = char_offset(WILDCARD_RESERVED_BASE, 1);
-/// Character representing any character string.
-pub const ANY_STRING_RECURSIVE: char = char_offset(WILDCARD_RESERVED_BASE, 2);
-/// This is a special pseudo-char that is not used other than to mark the
-/// end of the special characters so we can sanity check the enum range.
-#[allow(dead_code)]
-pub const ANY_SENTINEL: char = char_offset(WILDCARD_RESERVED_BASE, 3);
+localizable_consts!(
+    COMPLETE_EXEC_DESC "command"
+    COMPLETE_EXEC_LINK_DESC "command link"
+    COMPLETE_FILE_DESC "file"
+    COMPLETE_SYMLINK_DESC "symlink"
+    COMPLETE_DIRECTORY_SYMLINK_DESC "dir symlink"
+    COMPLETE_DIRECTORY_DESC "directory"
+);
 
 #[derive(PartialEq)]
 pub enum WildcardResult {
@@ -159,16 +149,11 @@ fn wildcard_complete_internal(
 
         // Note: out_completion may be empty if the completion really is empty, e.g. tab-completing
         // 'foo' when a file 'foo' exists.
-        let local_flags = if full_replacement {
-            flags | CompleteFlags::REPLACES_TOKEN
-        } else {
-            flags
-        };
         if !out.add(Completion::new(
             out_completion.to_owned(),
             out_desc,
             m,
-            local_flags,
+            flags,
         )) {
             return WildcardResult::Overflow;
         }
@@ -212,14 +197,7 @@ fn wildcard_complete_internal(
             if s.is_empty() {
                 return WildcardResult::NoMatch;
             }
-            return wildcard_complete_internal(
-                s.slice_from(1),
-                wc.slice_from(1),
-                params,
-                flags,
-                out,
-                false,
-            );
+            wildcard_complete_internal(s.slice_from(1), wc.slice_from(1), params, flags, out, false)
         }
         ANY_STRING => {
             // Hackish. If this is the last character of the wildcard, then just complete with
@@ -264,10 +242,10 @@ fn wildcard_complete_internal(
                 }
             }
 
-            return match has_match {
+            match has_match {
                 true => WildcardResult::Match,
                 false => WildcardResult::NoMatch,
-            };
+            }
         }
         // We don't even try with this one.
         ANY_STRING_RECURSIVE => WildcardResult::NoMatch,
@@ -289,7 +267,7 @@ pub fn wildcard_complete(
         expand_flags,
     };
 
-    return wildcard_complete_internal(s, wc, &params, flags, out, true);
+    wildcard_complete_internal(s, wc, &params, flags, out, true)
 }
 
 /// Obtain a description string for the file specified by the filename.
@@ -308,24 +286,25 @@ fn file_get_desc(
     is_link: bool,
     definitely_executable: bool,
 ) -> &'static wstr {
-    let is_executable =
-        |filename: &wstr| -> bool { definitely_executable || waccess(filename, X_OK) == 0 };
+    let is_executable = |filename: &wstr| -> bool {
+        definitely_executable || waccess(filename, AccessFlags::X_OK).is_ok()
+    };
 
-    return if is_link {
+    if is_link {
         if is_dir {
-            *COMPLETE_DIRECTORY_SYMLINK_DESC
+            wgettext!(COMPLETE_DIRECTORY_SYMLINK_DESC)
         } else if is_executable(filename) {
-            *COMPLETE_EXEC_LINK_DESC
+            wgettext!(COMPLETE_EXEC_LINK_DESC)
         } else {
-            *COMPLETE_SYMLINK_DESC
+            wgettext!(COMPLETE_SYMLINK_DESC)
         }
     } else if is_dir {
-        *COMPLETE_DIRECTORY_DESC
+        wgettext!(COMPLETE_DIRECTORY_DESC)
     } else if is_executable(filename) {
-        *COMPLETE_EXEC_DESC
+        wgettext!(COMPLETE_EXEC_DESC)
     } else {
-        *COMPLETE_FILE_DESC
-    };
+        wgettext!(COMPLETE_FILE_DESC)
+    }
 }
 
 /// Test if the given file is an executable (if executables_only) or directory (if
@@ -333,7 +312,7 @@ fn file_get_desc(
 /// up. Note that the filename came from a readdir() call, so we know it exists.
 fn wildcard_test_flags_then_complete(
     filepath: &wstr,
-    filename: &wstr,
+    mut filename: &wstr,
     wc: &wstr,
     expand_flags: ExpandFlags,
     out: &mut CompletionReceiver,
@@ -377,12 +356,32 @@ fn wildcard_test_flags_then_complete(
     }
 
     // regular file *excludes* broken links - we have no use for them as commands.
-    let is_regular_file = entry
-        .check_type()
-        .map(|x| x == DirEntryType::reg)
-        .unwrap_or(false);
-    if executables_only && (!is_regular_file || waccess(filepath, X_OK) != 0) {
+    let is_regular_file = entry.check_type().is_some_and(|x| x == DirEntryType::Reg);
+    let is_executable =
+        LazyCell::new(|| is_regular_file && waccess(filepath, AccessFlags::X_OK).is_ok());
+    if executables_only && !*is_executable {
         return false;
+    }
+
+    let filepath_stat = LazyCell::new(|| lwstat(filepath));
+
+    // For executables on Cygwin, prefer the name without the .exe, to match
+    // better with Unix names, but only if there isn't also a file without that
+    // extension and the user hasn't started to type the extension
+    if let Some(filepath_stripped) = strip_executable_suffix(filepath) {
+        let stripped_filename_len = filename.len() - (filepath.len() - filepath_stripped.len());
+        if wc.len() <= stripped_filename_len && *is_executable {
+            let stat_stripped = lwstat(filepath_stripped).map(|stat| (stat.dev(), stat.ino()));
+            let stat = filepath_stat.as_ref().map(|stat| (stat.dev(), stat.ino()));
+
+            // TODO(MSRV>=1.88): feature(let_chains)
+            //   if let Ok(stat_stripped) = stat_stripped
+            //       && let Ok(stat) = stat
+            //       && stat_stripped == stat
+            if stat_stripped.is_ok() && stat.is_ok() && stat_stripped.unwrap() == stat.unwrap() {
+                filename = &filename[0..filename.len() - 4];
+            }
+        }
     }
 
     // Compute the description.
@@ -394,8 +393,7 @@ fn wildcard_test_flags_then_complete(
             None => {
                 // We do not know it's a link from the d_type,
                 // so we will have to do an lstat().
-                let lstat: Option<fs::Metadata> = lwstat(filepath).ok();
-                if let Some(md) = &lstat {
+                if let Ok(md) = filepath_stat.as_ref() {
                     md.is_symlink()
                 } else {
                     // This file is no longer be usable, skip it.
@@ -433,11 +431,10 @@ fn wildcard_test_flags_then_complete(
 }
 
 mod expander {
-    use libc::F_OK;
 
     use crate::{
         path::append_path_component,
-        wutil::{dir_iter::DirIter, normalize_path, DevInode},
+        wutil::{DevInode, dir_iter::DirIter, normalize_path},
     };
 
     use super::*;
@@ -485,7 +482,7 @@ mod expander {
                 working_directory,
                 completion_set: resolved_completions
                     .iter()
-                    .map(|c| c.completion.to_owned())
+                    .map(|c| c.completion.clone())
                     .collect(),
                 visited_files: HashSet::new(),
                 flags,
@@ -562,7 +559,7 @@ mod expander {
 
                 if allow_fuzzy
                     && self.resolved_completions.len() == before
-                    && waccess(&intermediate_dirpath, F_OK) != 0
+                    && waccess(&intermediate_dirpath, AccessFlags::F_OK).is_err()
                 {
                     assert!(self.flags.contains(ExpandFlags::FOR_COMPLETIONS));
                     if let Ok(mut base_dir_iter) = self.open_dir(base_dir, false) {
@@ -633,8 +630,8 @@ mod expander {
                 // ANY_STRING_RECURSIVE character is present in both the head and the tail.
                 let head_any = wc_segment.slice_to(asr_idx + 1);
                 let any_tail = wc.slice_from(asr_idx);
-                assert!(head_any.chars().next_back().unwrap() == ANY_STRING_RECURSIVE);
-                assert!(any_tail.chars().next().unwrap() == ANY_STRING_RECURSIVE);
+                assert_eq!(head_any.chars().next_back().unwrap(), ANY_STRING_RECURSIVE);
+                assert_eq!(any_tail.chars().next().unwrap(), ANY_STRING_RECURSIVE);
 
                 dir.rewind();
                 self.expand_intermediate_segment(
@@ -650,9 +647,9 @@ mod expander {
 
         pub fn status_code(&self) -> WildcardResult {
             if self.did_interrupt {
-                return WildcardResult::Cancel;
+                WildcardResult::Cancel
             } else if self.did_overflow {
-                return WildcardResult::Overflow;
+                WildcardResult::Overflow
             } else if self.did_add {
                 WildcardResult::Match
             } else {
@@ -670,7 +667,7 @@ mod expander {
 
             if !self.flags.contains(ExpandFlags::FOR_COMPLETIONS) {
                 // Trailing slash and not accepting incomplete, e.g. `echo /xyz/`. Insert this file after checking it exists.
-                if waccess(base_dir, F_OK) == 0 {
+                if waccess(base_dir, AccessFlags::F_OK).is_ok() {
                     self.add_expansion_result(base_dir.to_owned());
                 }
                 return;
@@ -693,7 +690,7 @@ mod expander {
                 let known_dir = need_dir && entry.is_dir();
                 if need_dir && !known_dir {
                     continue;
-                };
+                }
                 if !entry.name.is_empty() && !entry.name.starts_with('.') {
                     self.try_add_completion_result(
                         &(base_dir.to_owned() + entry.name.as_utfstr()),
@@ -794,7 +791,6 @@ mod expander {
                 let Some(m) = string_fuzzy_match_string(wc_segment, &entry.name, false) else {
                     continue;
                 };
-                // The first port had !n.is_samecase_exact
                 if m.is_samecase_exact() {
                     continue;
                 }
@@ -929,7 +925,7 @@ mod expander {
                         break;
                     } else if entry.is_dir() && unique_entry.is_empty() {
                         // first candidate
-                        unique_entry = entry.name.to_owned();
+                        unique_entry = entry.name.clone();
                     } else {
                         // We either have two or more candidates, or the child is not a directory. We're
                         // done.
@@ -950,7 +946,7 @@ mod expander {
                 abs_unique_hierarchy.push('/');
             }
 
-            return unique_hierarchy;
+            unique_hierarchy
         }
 
         fn try_add_completion_result(
@@ -987,8 +983,7 @@ mod expander {
                 // Note that prepend_token_prefix is a no-op unless COMPLETE_REPLACES_TOKEN is set
                 let after = self.resolved_completions.len();
                 for c in self.resolved_completions[before..after].iter_mut() {
-                    if info.has_fuzzy_ancestor && !(c.flags.contains(CompleteFlags::REPLACES_TOKEN))
-                    {
+                    if info.has_fuzzy_ancestor && !c.replaces_token() {
                         c.flags |= CompleteFlags::REPLACES_TOKEN;
                         c.prepend_token_prefix(wildcard);
                     }
@@ -1026,10 +1021,10 @@ mod expander {
                 path = normalize_path(&path, true);
             }
 
-            return match dotdot {
+            match dotdot {
                 true => DirIter::new_with_dots(&path),
                 false => DirIter::new(&path),
-            };
+            }
         }
     }
 }
@@ -1102,13 +1097,13 @@ pub fn wildcard_expand_string<'closure>(
 
     let mut expander = WildCardExpander::new(prefix, flags, &mut cancel_checker, output);
     expander.expand(base_dir, effective_wc, base_dir, ParentInfo::default());
-    return expander.status_code();
+    expander.status_code()
 }
 
 /// Test whether the given wildcard matches the string. Does not perform any I/O.
 ///
 /// \param str The string to test
-/// \param wc The wildcard to test against
+/// \param pattern The wildcard to test against
 /// \param leading_dots_fail_to_match if set, strings with leading dots are assumed to be hidden
 /// files and are not matched (default was false)
 ///
@@ -1203,7 +1198,7 @@ pub fn wildcard_has_internal(s: impl AsRef<wstr>) -> bool {
 #[must_use]
 pub fn wildcard_has(s: impl AsRef<wstr>) -> bool {
     let s = s.as_ref();
-    let qmark_is_wild = !feature_test(FeatureFlag::qmark_noglob);
+    let qmark_is_wild = !feature_test(FeatureFlag::QuestionMarkNoGlob);
     // Fast check for * or ?; if none there is no wildcard.
     // Note some strings contain * but no wildcards, e.g. if they are quoted.
     if !s.contains('*') && (!qmark_is_wild || !s.contains('?')) {
@@ -1211,13 +1206,13 @@ pub fn wildcard_has(s: impl AsRef<wstr>) -> bool {
     }
     let unescaped =
         unescape_string(s, UnescapeStringStyle::Script(UnescapeFlags::SPECIAL)).unwrap_or_default();
-    return wildcard_has_internal(unescaped);
+    wildcard_has_internal(unescaped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::future_feature_flags::scoped_test;
+    use fish_feature_flags::with_overridden_feature;
 
     #[test]
     fn test_wildcards() {
@@ -1230,12 +1225,12 @@ mod tests {
         let wc = unescape_string(wc, UnescapeStringStyle::Script(UnescapeFlags::SPECIAL)).unwrap();
         assert!(!wildcard_has(&wc) && wildcard_has_internal(&wc));
 
-        scoped_test(FeatureFlag::qmark_noglob, false, || {
+        with_overridden_feature(FeatureFlag::QuestionMarkNoGlob, false, || {
             assert!(wildcard_has(L!("?")));
             assert!(!wildcard_has(L!("\\?")));
         });
 
-        scoped_test(FeatureFlag::qmark_noglob, true, || {
+        with_overridden_feature(FeatureFlag::QuestionMarkNoGlob, true, || {
             assert!(!wildcard_has(L!("?")));
             assert!(!wildcard_has(L!("\\?")));
         });

@@ -5,11 +5,10 @@
 
 # The default history-delete binding is shift-delete which
 # won't work on terminals that don't support CSI u, so rebind.
-set -g isolated_tmux_fish_extra_args -C '
+isolated-tmux-start -C '
     set -g fish_autosuggestion_enabled 0
     bind alt-d history-delete or backward-delete-char
 '
-isolated-tmux-start
 
 isolated-tmux send-keys 'true needle' Enter
 # CHECK: prompt 0> true needle
@@ -72,3 +71,8 @@ tmux-sleep
 isolated-tmux capture-pane -p | grep "^foo\|prompt 7>"
 # CHECK: foo
 # CHECK: prompt 7>
+
+isolated-tmux send-keys C-c ": Ö" Enter C-l ö C-p
+tmux-sleep
+isolated-tmux capture-pane -p
+# CHECK: prompt {{\d+}}> : Ö

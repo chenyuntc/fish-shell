@@ -1,12 +1,14 @@
 // Implementation of the bg builtin.
 
-use crate::proc::Pid;
+use std::{collections::HashSet, rc::Rc};
+
+use crate::{builtins::error::Error, err_fmt, err_str, proc::Pid};
 
 use super::prelude::*;
 
 /// Helper function for builtin_bg().
 fn send_to_bg(
-    parser: &Parser,
+    parser: &mut Parser,
     streams: &mut IoStreams,
     cmd: &wstr,
     job_pos: usize,
@@ -14,22 +16,20 @@ fn send_to_bg(
     {
         let jobs = parser.jobs();
         if !jobs[job_pos].wants_job_control() {
-            let err = {
-                let job = &jobs[job_pos];
-                wgettext_fmt!(
-                "%ls: Can't put job %s, '%ls' to background because it is not under job control\n",
-                cmd,
+            let job = &jobs[job_pos];
+            err_fmt!(
+                "Can't put job %s, '%s' to background because it is not under job control",
                 job.job_id().to_wstring(),
                 job.command()
             )
-            };
-            builtin_print_help_error(parser, streams, cmd, &err);
+            .cmd(cmd)
+            .finish(streams);
             return Err(STATUS_CMD_ERROR);
         }
 
         let job = &jobs[job_pos];
-        streams.err.append(wgettext_fmt!(
-            "Send job %s '%ls' to background\n",
+        streams.err.appendln(&wgettext_fmt!(
+            "Send job %s '%s' to background",
             job.job_id().to_wstring(),
             job.command()
         ));
@@ -42,14 +42,14 @@ fn send_to_bg(
     }
     parser.job_promote_at(job_pos);
 
-    return Ok(SUCCESS);
+    Ok(SUCCESS)
 }
 
 /// Builtin for putting a job in the background.
-pub fn bg(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
+pub fn bg(parser: &mut Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> BuiltinResult {
     let opts = HelpOnlyCmdOpts::parse(args, parser, streams)?;
 
-    let Some(&cmd) = args.get(0) else {
+    let Some(&cmd) = args.first() else {
         return Err(STATUS_INVALID_ARGS);
     };
 
@@ -67,9 +67,7 @@ pub fn bg(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
         };
 
         let Some(job_pos) = job_pos else {
-            streams
-                .err
-                .append(wgettext_fmt!("%ls: There are no suitable jobs\n", cmd));
+            err_str!(Error::NO_SUITABLE_JOBS).cmd(cmd).finish(streams);
             return Err(STATUS_CMD_ERROR);
         };
 
@@ -82,14 +80,9 @@ pub fn bg(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
     let mut retval: BuiltinResult = Ok(SUCCESS);
     let pids: Vec<Pid> = args[opts.optind..]
         .iter()
-        .filter_map(|arg| match fish_wcstoi(arg).map(Pid::new) {
-            Ok(Some(pid)) => Some(pid),
+        .filter_map(|arg| match parse_pid(streams, cmd, arg) {
+            Ok(pid) => Some(pid),
             _ => {
-                streams.err.append(wgettext_fmt!(
-                    "%ls: '%ls' is not a valid job specifier\n",
-                    cmd,
-                    arg
-                ));
                 retval = Err(STATUS_INVALID_ARGS);
                 None
             }
@@ -100,15 +93,18 @@ pub fn bg(parser: &Parser, streams: &mut IoStreams, args: &mut [&wstr]) -> Built
 
     // Background all existing jobs that match the pids.
     // Non-existent jobs aren't an error, but information about them is useful.
+    let mut seen = HashSet::new();
     for pid in pids {
-        if let Some((job_pos, _job)) = parser.job_get_with_index_from_pid(pid) {
-            send_to_bg(parser, streams, cmd, job_pos)?;
+        if let Some((job_pos, job)) = parser.job_get_with_index_from_pid(pid) {
+            if seen.insert(Rc::as_ptr(&job)) {
+                send_to_bg(parser, streams, cmd, job_pos)?;
+            }
         } else {
-            streams
-                .err
-                .append(wgettext_fmt!("%ls: Could not find job '%d'\n", cmd, pid));
+            err_fmt!(Error::COULD_NOT_FIND_JOB, pid)
+                .cmd(cmd)
+                .finish(streams);
         }
     }
 
-    return Ok(SUCCESS);
+    Ok(SUCCESS)
 }

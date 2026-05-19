@@ -20,10 +20,10 @@ function fish_delta
     end
 
     # TODO: Do we want to keep the vendor dirs in here?
-    set -l default_function_path $__fish_data_dir/functions
+    set -l default_function_path
     test "$vendormode" = default && set -a default_function_path $__fish_vendor_functionsdirs
 
-    set -l default_complete_path $__fish_data_dir/completions
+    set -l default_complete_path
     test "$vendormode" = default && set -a default_complete_path $__fish_vendor_completionsdirs
 
     set -l default_conf_path
@@ -69,7 +69,7 @@ function fish_delta
     set -l have_diff 0
 
     if isatty stdout
-        set -f colors "$(set_color normal)" "$(set_color brblue)" "$(set_color bryellow)" "$(set_color green)" "$(set_color red)"
+        set -f colors "$(set_color --reset)" "$(set_color brblue)" "$(set_color bryellow)" "$(set_color green)" "$(set_color red)"
         set -f pager (__fish_anypager)
         or set pager cat
 
@@ -110,38 +110,36 @@ function fish_delta
 
             for file in $files
                 set -l bn (path basename -- $file)
-                set -l def (path filter -rf -- $default_var/$bn)[1]
-                or set -l def (set -q dir[1] && status get-file $dir/$bn >/dev/null && echo embedded)
-                or begin
-                    if test $all_changed = 0
-                        set -ql _flag_n
-                        and printf (_ "%sNew%s: %s\n") $colors[2] $colors[1] $file
-                        continue
-                    else
-                        set def /dev/null
-                    end
+                set -l default_exists false
+                if set -q dir[1]; and contains $dir/$bn (status list-files $dir)
+                    set default_exists true
+                else if test $all_changed = 0
+                    set -ql _flag_n
+                    and printf (_ "%sNew%s: %s\n") $colors[2] $colors[1] $file
+                    continue
                 end
-
                 if type -q diff
-                    # We execute diff twice - once to figure out if it's changed,
-                    # so we can get nicer output.
-                    #
-                    if test "$def" = embedded
-                        if not status get-file $dir/$bn | diff -q -- $file - >/dev/null 2>&1
+                    function __fish_delta_diff -V _flag_d -V colors -V file -a default_file
+                        # We execute diff twice - once to figure out if it's changed,
+                        # so we can get nicer output.
+                        #
+                        if not diff -q -- $file $default_file >/dev/null 2>&1
                             printf (_ "%sChanged%s: %s\n") $colors[3] $colors[1] $file
                             not set -ql _flag_d[1]
-                            and status get-file $dir/$bn | diff -u -- - $file
-                            continue
-                        end
-                    else
-                        if not diff -q -- $file $def >/dev/null 2>&1
-                            printf (_ "%sChanged%s: %s\n") $colors[3] $colors[1] $file
-                            not set -ql _flag_d[1]
-                            and diff -u -- $def $file
-                            continue
+                            and diff -u -- $default_file $file
+                        else
+                            printf (_ "%sUnmodified%s: %s\n") $colors[4] $colors[1] $file
                         end
                     end
-                    printf (_ "%sUnmodified%s: %s\n") $colors[4] $colors[1] $file
+                    if $default_exists
+                        set -l tmpfile (__fish_mktemp_relative fish-delta)
+                        status get-file $dir/$bn >$tmpfile
+                        __fish_delta_diff $tmpfile
+                        command rm $tmpfile
+                    else
+                        __fish_delta_diff /dev/null
+                    end
+                    functions --erase __fish_delta_diff
                 else
                     # Without diff, we can't really tell if the contents are the same.
                     printf (_ "%sPossibly changed%s: %s\n") $colors[3] $colors[1] $file

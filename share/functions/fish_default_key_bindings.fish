@@ -8,7 +8,7 @@ function fish_default_key_bindings -d "emacs-like key binds"
     if not set -q argv[1]
         bind --erase --all --preset # clear earlier bindings, if any
         if test "$fish_key_bindings" != fish_default_key_bindings
-            __fish_change_key_bindings fish_default_key_bindings || return
+            __fish_change_key_bindings fish_default_key_bindings
             set fish_bind_mode default
         end
     end
@@ -51,26 +51,18 @@ function fish_default_key_bindings -d "emacs-like key binds"
     bind --preset $argv alt-u upcase-word
 
     bind --preset $argv alt-c capitalize-word
-    if test (__fish_uname) = Darwin
-        bind --preset $argv alt-backspace backward-kill-word
-        bind --preset $argv ctrl-alt-h backward-kill-word
-        bind --preset $argv ctrl-backspace backward-kill-token
-        bind --preset $argv alt-delete kill-word
-        bind --preset $argv ctrl-delete kill-token
-    else
-        bind --preset $argv alt-backspace backward-kill-token
-        bind --preset $argv ctrl-alt-h backward-kill-token
-        bind --preset $argv ctrl-backspace backward-kill-word
-        bind --preset $argv alt-delete kill-token
-        bind --preset $argv ctrl-delete kill-word
-    end
+    __fish_per_os_bind --preset $argv alt-backspace backward-kill-word backward-kill-token
+    __fish_per_os_bind --preset $argv ctrl-alt-h backward-kill-word backward-kill-token
+    __fish_per_os_bind --preset $argv ctrl-backspace backward-kill-token backward-kill-word
+    __fish_per_os_bind --preset $argv alt-delete kill-word kill-token
+    __fish_per_os_bind --preset $argv ctrl-delete kill-token kill-word
 
     bind --preset $argv alt-\< beginning-of-buffer
     bind --preset $argv alt-\> end-of-buffer
 
     bind --preset $argv ctrl-r history-pager
 
-    # term-specific special bindings
+    # TODO(term-workaround)
     switch "$TERM"
         case xterm-256color
             # Microsoft's conemu uses xterm-256color plus

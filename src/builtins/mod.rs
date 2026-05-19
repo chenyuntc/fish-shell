@@ -5,23 +5,28 @@ pub mod argparse;
 pub mod bg;
 pub mod bind;
 pub mod block;
+pub mod r#break;
+pub mod breakpoint;
 pub mod builtin;
 pub mod cd;
 pub mod command;
 pub mod commandline;
 pub mod complete;
 pub mod contains;
+pub mod r#continue;
 pub mod count;
 pub mod disown;
 pub mod echo;
 pub mod emit;
 pub mod eval;
 pub mod exit;
+pub mod r#false;
 pub mod fg;
 pub mod fish_indent;
 pub mod fish_key_reader;
 pub mod function;
 pub mod functions;
+pub mod r#gettext;
 pub mod history;
 pub mod jobs;
 pub mod math;
@@ -38,12 +43,10 @@ pub mod source;
 pub mod status;
 pub mod string;
 pub mod test;
+pub mod r#true;
 pub mod r#type;
 pub mod ulimit;
 pub mod wait;
-
-#[cfg(test)]
-mod tests;
 
 mod prelude {
     pub use super::shared::*;
@@ -52,15 +55,16 @@ mod prelude {
 
     #[allow(unused_imports)]
     pub(crate) use crate::{
-        flog::{FLOG, FLOGF},
+        flog::{flog, flogf},
         io::{IoStreams, SeparationType},
         parser::Parser,
-        wchar::prelude::*,
-        wgetopt::{
-            wopt,
-            ArgType::{self, *},
-            WGetopter, WOption, NON_OPTION_CHAR,
-        },
+        prelude::*,
         wutil::{fish_wcstoi, fish_wcstol, fish_wcstoul},
     };
+    pub(crate) use fish_wgetopt::{
+        ArgType::{self, *},
+        NON_OPTION_CHAR, WGetopter, WOption, wopt,
+    };
 }
+
+pub use shared::*;

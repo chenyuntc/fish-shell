@@ -1,3 +1,4 @@
+# localization: skip(private)
 function __fish_cached --description "Cache the command output for a given amount of time"
 
     argparse --min-args 1 --max-args 1 --stop-nonopt 't/max-age=!_validate_int --min 0' 'k/cache-key=' -- $argv
@@ -22,9 +23,15 @@ function __fish_cached --description "Cache the command output for a given amoun
     set -l cache_file (path normalize $cache_dir/$cache_key)
     set -l cache_age (path mtime --relative $cache_file)
 
+    set -l populate_cache (__fish_posix_shell) -c "
+        {
+            $argv
+        } >$cache_file || rm $cache_file 2>/dev/null
+    "
+
     if not test -f $cache_file
         __fish_cache_put $cache_file
-        sh -c "{ $argv; } >$cache_file || rm $cache_file 2>/dev/null" &
+        $populate_cache &
 
         if test -n "$last_pid"
             # wait for at most 1 second if supported
@@ -38,7 +45,7 @@ function __fish_cached --description "Cache the command output for a given amoun
 
         if test $cache_age -gt $max_age
             __fish_cache_put $cache_file
-            sh -c "{ $argv; } >$cache_file || rm $cache_file 2>/dev/null" &
+            $populate_cache &
         end
     end
 end

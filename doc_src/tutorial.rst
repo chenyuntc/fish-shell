@@ -1,7 +1,5 @@
 .. highlight:: fish-docs-samples
 
-.. _tutorial:
-
 Tutorial
 ========
 
@@ -39,11 +37,11 @@ This tutorial assumes a basic understanding of command line shells and Unix comm
 
 If you have a strong understanding of other shells, and want to know what fish does differently, search for the magic phrase *unlike other shells*, which is used to call out important differences.
 
-Or, if you want a quick overview over the differences to other shells like Bash, see :ref:`Fish For Bash Users <fish_for_bash_users>`.
+Or, if you want a quick overview over the differences to other shells like Bash, see :doc:`Fish For Bash Users <fish_for_bash_users>`.
 
-For the full, detailed description of how to use fish interactively, see :ref:`Interactive Use <interactive>`.
+For the full, detailed description of how to use fish interactively, see :doc:`Interactive Use <interactive>`.
 
-For a comprehensive description of fish's scripting language, see :ref:`The Fish Language<language>`.
+For a comprehensive description of fish's scripting language, see :doc:`The Fish Language <language>`.
 
 Running Commands
 ----------------
@@ -115,7 +113,7 @@ These colors, and many more, can be changed by running ``fish_config``, or by mo
 
 For example, if you want to disable (almost) all coloring::
 
-  fish_config theme choose None
+  fish_config theme choose none
 
 This picks the "none" theme. To see all themes::
 
@@ -325,7 +323,7 @@ This also means that, if the list is empty, there will be no argument::
 
     > set empty # no argument
     > echo $empty/this_is_gone # prints an empty line
-    
+
 If you quote the list, it will be used as one string and so you'll get one argument even if it is empty.
 
 For more, see :ref:`Lists <variables-lists>`.
@@ -433,7 +431,7 @@ Like other shells, fish allows multiple commands either on separate lines or the
 To write them on the same line, use the semicolon (";"). That means the following two examples are equivalent::
 
     echo fish; echo chips
-    
+
     # or
     echo fish
     echo chips
@@ -484,8 +482,6 @@ As mentioned in :ref:`the section on the semicolon <tut-semicolon>`, this can al
     and echo "Backup successful"
     or echo "Backup failed"
 
-.. _tut-conditionals:
-
 Conditionals (If, Else, Switch)
 -------------------------------
 
@@ -508,9 +504,9 @@ To compare strings or numbers or check file properties (whether a file exists or
     if test "$fish" = "flounder"
         echo FLOUNDER
     end
-    
+
     # or
-    
+
     if test "$number" -gt 5
         echo $number is greater than five
     else
@@ -583,7 +579,7 @@ You can see the source for any function by passing its name to ``functions``::
 
 For more, see :ref:`Functions <syntax-function>`.
 
-.. [#] There is a function called :doc:`alias <cmds/alias>`, but it's just a shortcut to make functions. fish also provides :ref:`abbreviations <abbreviations>`, through the :ref:`abbr <cmd-abbr>` command.
+.. [#] There is a function called :doc:`alias <cmds/alias>`, but it's just a shortcut to make functions. fish also provides :ref:`abbreviations <abbreviations>`, through the :doc:`abbr <cmds/abbr>` command.
 
 Loops
 -----
@@ -637,7 +633,7 @@ Multiple lines are OK. Colors can be set via :doc:`set_color <cmds/set_color>` b
         set_color purple
         date "+%m/%d/%y"
         set_color FF0000
-        echo (pwd) '>' (set_color normal)
+        echo (pwd) '>' (set_color --reset)
     end
 
 
@@ -702,9 +698,9 @@ It is possible to directly create functions and variables in ``config.fish`` fil
 ::
 
     > cat ~/.config/fish/config.fish
-    
+
     set -x PATH $PATH /sbin/
-    
+
     function ll
         ls -lh $argv
     end
@@ -742,7 +738,7 @@ See the documentation for :doc:`funced <cmds/funced>` and :doc:`funcsave <cmds/f
 Universal Variables
 -------------------
 
-A universal variable is a variable whose value is shared across all instances of fish, now and in the future – even after a reboot. You can make a variable universal with ``set -U``::
+A universal variable is a variable whose value is shared across all instances of fish, now and in the future - even after a reboot. You can make a variable universal with ``set -U``::
 
     > set -U EDITOR vim
 
