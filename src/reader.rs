@@ -4793,15 +4793,6 @@ fn get_autosuggestion_performer(
         };
 
         if llm_mode {
-            let github_token_opt = vars
-                .get(L!("GITHUB_TOKEN"))
-                .map(|v| v.as_string().to_string())
-                .or_else(|| std::env::var("GITHUB_TOKEN").ok());
-
-            let Some(github_token) = github_token_opt else {
-                return nothing;
-            };
-
             let history_size = history.size();
             let mut recent_commands = Vec::new();
             if history_size > 0 {
@@ -4825,7 +4816,6 @@ fn get_autosuggestion_performer(
 
             let llm_completion = match copilot_autocomplete(
                 &prompt,
-                &github_token,
                 Some(128),
                 Some(0.),
                 Some(vec!["\n".to_string()]),

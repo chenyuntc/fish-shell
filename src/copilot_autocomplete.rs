@@ -170,22 +170,136 @@ impl CodestralClient {
     }
 }
 
-// For backward compatibility, keep the old function name as an alias
+// Back-compat wrapper. Provider selected by `FISH_LLM_PROVIDER` env var:
+//   "fireworks" → Fireworks (Kimi K2), suffix ignored
+//   anything else / unset → Codestral (FIM, default)
 pub fn copilot_autocomplete(
     prompt: &str,
-    _github_token: &str,  // Ignored, will use CODESTRAL_API_KEY
     max_tokens: Option<i32>,
-    _temperature: Option<f64>,  // Ignored, always 0
+    _temperature: Option<f64>,
     stops: Option<Vec<String>>,
-    _language: Option<&str>,  // Ignored
+    _language: Option<&str>,
     suffix: Option<&str>,
-    _is_copilot_token: bool,  // Ignored
+    _is_copilot_token: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    codestral_autocomplete(prompt, None, max_tokens, stops, suffix)
+    match env::var("FISH_LLM_PROVIDER").as_deref() {
+        Ok("fireworks") => fireworks_autocomplete(prompt, None, max_tokens, stops),
+        _ => codestral_autocomplete(prompt, None, max_tokens, stops, suffix),
+    }
 }
 
 // For backward compatibility, keep CopilotClient as an alias
 pub type CopilotClient = CodestralClient;
+
+// ---------------- Fireworks (Kimi K2) provider ----------------
+
+#[derive(Debug, Deserialize)]
+struct FireworksChoice {
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FireworksResponse {
+    choices: Vec<FireworksChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct FireworksRequest {
+    model: String,
+    prompt: String,
+    stop: Vec<String>,
+    max_tokens: i32,
+    temperature: f64,
+}
+
+fn make_fireworks_request(
+    api_key: &str,
+    prompt: &str,
+    max_tokens: i32,
+    stops: Vec<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let payload = FireworksRequest {
+        model: "accounts/fireworks/models/kimi-k2p6".to_string(),
+        prompt: prompt.to_string(),
+        stop: stops,
+        max_tokens,
+        temperature: 0.0,
+    };
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_millis(5000))
+        .build()?;
+
+    let response = client
+        .post("https://api.fireworks.ai/inference/v1/completions")
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Bearer {}", api_key))
+        .json(&payload)
+        .send()?;
+
+    if !response.status().is_success() {
+        let error_text = response.text()?;
+        eprintln!("Error response: {}", error_text);
+        return Err(format!("HTTP error: {}", error_text).into());
+    }
+
+    let fireworks_response: FireworksResponse = response.json()?;
+    if !fireworks_response.choices.is_empty() {
+        Ok(fireworks_response.choices[0].text.clone())
+    } else {
+        Ok(String::new())
+    }
+}
+
+/// Get code completion from Fireworks (Kimi K2). No FIM / no suffix.
+pub fn fireworks_autocomplete(
+    prompt: &str,
+    api_key: Option<&str>,
+    max_tokens: Option<i32>,
+    stops: Option<Vec<String>>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let api_key = if let Some(key) = api_key {
+        key.to_string()
+    } else {
+        env::var("FIREWORK_API_KEY").map_err(|_| {
+            "FIREWORK_API_KEY environment variable not set and no API key provided"
+        })?
+    };
+
+    let stops = stops.unwrap_or_else(|| vec!["\n\n".to_string()]);
+    let max_tokens = max_tokens.unwrap_or(128);
+
+    make_fireworks_request(&api_key, prompt, max_tokens, stops)
+}
+
+pub struct FireworksClient {
+    api_key: String,
+}
+
+impl FireworksClient {
+    pub fn new(api_key: Option<String>) -> Result<Self, Box<dyn std::error::Error>> {
+        let api_key = if let Some(key) = api_key {
+            key
+        } else {
+            env::var("FIREWORK_API_KEY").map_err(|_| {
+                "FIREWORK_API_KEY environment variable not set and no API key provided"
+            })?
+        };
+        Ok(FireworksClient { api_key })
+    }
+
+    pub fn autocomplete(
+        &self,
+        prompt: &str,
+        max_tokens: Option<i32>,
+        stops: Option<Vec<String>>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let stops = stops.unwrap_or_else(|| vec!["\n\n".to_string()]);
+        let max_tokens = max_tokens.unwrap_or(128);
+        make_fireworks_request(&self.api_key, prompt, max_tokens, stops)
+    }
+}
 
 // Main function for testing
 fn main() {
